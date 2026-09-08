@@ -12,6 +12,7 @@ import {
   viewImage,
   closeViewer,
 } from './store.js'
+import { GetDouyinCookie, SetDouyinCookie } from '../wailsjs/go/main/App'
 import ImageGrid from './components/ImageGrid.vue'
 import WatermarkCanvas from './components/WatermarkCanvas.vue'
 
@@ -42,6 +43,46 @@ const pct = computed(() =>
 const urlRef = ref(null)
 const showNotice = ref(false)
 
+// 抖音 Cookie 设置弹窗
+const showCookie = ref(false)
+const cookieInput = ref('')
+const cookieSaving = ref(false)
+
+async function openCookie() {
+  try {
+    cookieInput.value = await GetDouyinCookie()
+  } catch {
+    cookieInput.value = ''
+  }
+  showCookie.value = true
+}
+
+async function saveCookie() {
+  cookieSaving.value = true
+  try {
+    await SetDouyinCookie(cookieInput.value.trim())
+    showToast('抖音 Cookie 已保存', 'ok')
+    showCookie.value = false
+  } catch (e) {
+    showToast('保存失败: ' + e)
+  } finally {
+    cookieSaving.value = false
+  }
+}
+
+async function clearCookie() {
+  cookieSaving.value = true
+  try {
+    await SetDouyinCookie('')
+    cookieInput.value = ''
+    showToast('已清除抖音 Cookie', 'ok')
+  } catch (e) {
+    showToast('清除失败: ' + e)
+  } finally {
+    cookieSaving.value = false
+  }
+}
+
 function go() {
   if (store.running) return
   startDownload()
@@ -66,6 +107,7 @@ function onKey(e) {
   if (e.key === 'Escape') {
     if (store.viewer.open) closeViewer()
     else if (showNotice.value) showNotice.value = false
+    else if (showCookie.value) showCookie.value = false
   }
 }
 </script>
@@ -127,6 +169,12 @@ function onKey(e) {
                 📁 选择本地文件夹
               </button>
               <span class="local-tip">直接识别并去水印本机图片，无需下载</span>
+            </div>
+            <div class="local-row">
+              <button class="btn cookie-btn" :disabled="store.running" @click="openCookie">
+                🍪 抖音 Cookie 设置
+              </button>
+              <span class="local-tip">抖音链接下载失败（风控）时配置，可提高成功率</span>
             </div>
             <div class="platforms">
               <span class="chip">微信公众号</span>
@@ -297,6 +345,42 @@ function onKey(e) {
       </div>
     </transition>
 
+    <!-- 抖音 Cookie 设置弹窗 -->
+    <transition name="fade">
+      <div v-if="showCookie" class="notice-mask" @click.self="showCookie = false">
+        <div class="card notice-panel cookie-panel">
+          <div class="notice-head">
+            <span class="notice-title">🍪 抖音 Cookie 设置</span>
+            <button class="viewer-close" @click="showCookie = false">✕</button>
+          </div>
+          <div class="notice-body">
+            <p>抖音风控较强，未登录状态下解析经常被拦截。配置浏览器 Cookie 可显著提高成功率（仅保存在本机）：</p>
+            <ol class="cookie-steps">
+              <li>用浏览器打开 <b>www.douyin.com</b> 并登录账号</li>
+              <li>按 <b>F12</b> 打开开发者工具，切到 <b>Network（网络）</b> 标签</li>
+              <li>刷新页面，点击列表中第一个请求，查看 <b>Headers</b></li>
+              <li>在 <b>Request Headers</b> 里找到 <b>Cookie</b> 一行，右键复制完整值，粘贴到下方</li>
+            </ol>
+            <textarea
+              v-model="cookieInput"
+              class="cookie-input"
+              rows="5"
+              placeholder="粘贴 Cookie：ttwid=xxx; msToken=xxx; ..."
+              spellcheck="false"
+            ></textarea>
+          </div>
+          <div class="notice-foot cookie-foot">
+            <button class="btn cookie-clear" :disabled="cookieSaving" @click="clearCookie">清除</button>
+            <span class="cookie-spacer"></span>
+            <button class="btn" :disabled="cookieSaving" @click="showCookie = false">取消</button>
+            <button class="btn btn-primary" :disabled="cookieSaving" @click="saveCookie">
+              {{ cookieSaving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
     <!-- Toast -->
     <transition name="fade">
       <div v-if="store.toast" class="toast" :class="store.toastKind">{{ store.toast }}</div>
@@ -444,6 +528,43 @@ function onKey(e) {
 .local-divider { height: 1px; width: 72px; background: var(--card-border); }
 .local-label { font-size: 12px; color: var(--text-3); }
 .local-tip { font-size: 12px; color: var(--text-3); }
+
+/* 抖音 Cookie 设置 */
+.cookie-btn {
+  border: none;
+  font-family: inherit;
+  box-shadow: inset 0 0 0 1px rgba(10, 132, 255, 0.45);
+  color: var(--accent);
+  background: transparent;
+}
+.cookie-btn:hover { background: rgba(10, 132, 255, 0.14); }
+.cookie-panel { width: min(560px, 94vw); }
+.cookie-steps {
+  margin: 10px 0 0;
+  padding-left: 22px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.9;
+}
+.cookie-input {
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: rgba(128, 128, 128, 0.08);
+  color: var(--text);
+  font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  line-height: 1.5;
+  resize: vertical;
+  box-sizing: border-box;
+  word-break: break-all;
+}
+.cookie-input:focus { outline: none; border-color: var(--accent); }
+.cookie-foot { justify-content: flex-start; gap: 8px; }
+.cookie-foot .cookie-clear { color: var(--danger); }
+.cookie-foot .cookie-spacer { flex: 1; }
 .platforms { margin-top: 18px; display: flex; gap: 8px; justify-content: center; }
 .chip {
   font-size: 12px; color: var(--text-2);

@@ -56,9 +56,10 @@ func NewApp(dllPath, modelPath string) *App {
 	return &App{dllPath: dllPath, modelPath: modelPath}
 }
 
-// startup Wails 生命周期：保存 ctx 并后台预热模型。
+// startup Wails 生命周期：保存 ctx、恢复持久化的平台 Cookie 并后台预热模型。
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	downloader.LoadPlatformCookiePersist(appDataDir())
 	go func() {
 		if _, err := a.ensureEngine(); err != nil {
 			runtime.EventsEmit(a.ctx, "pipe:error", map[string]string{
@@ -303,6 +304,19 @@ func (a *App) PrepareSubset(paths []string) (string, error) {
 	return dir, nil
 }
 
+// ---------------------------------------------------------- 平台 Cookie 设置
+
+// SetDouyinCookie 保存抖音 Cookie（传空白串清除并删除持久化文件）。
+// Cookie 保存到 %LOCALAPPDATA%/LaMaWatermarkRemover/douyin_cookie.txt，启动时自动恢复。
+func (a *App) SetDouyinCookie(raw string) error {
+	return downloader.SetPlatformCookiePersist(appDataDir(), "douyin", raw)
+}
+
+// GetDouyinCookie 读取当前生效的抖音 Cookie（未配置返回空串）。
+func (a *App) GetDouyinCookie() string {
+	return downloader.PlatformCookie("douyin")
+}
+
 // ---------------------------------------------------------- 工具
 
 func toUniformNRGBA(img image.Image) *image.NRGBA {
@@ -315,11 +329,19 @@ func toUniformNRGBA(img image.Image) *image.NRGBA {
 }
 
 func workspaceDir() string {
+	dir := filepath.Join(appDataDir(), "workspace")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// appDataDir 应用数据目录：%LOCALAPPDATA%/LaMaWatermarkRemover。
+// 用于 workspace、平台 Cookie 持久化等。
+func appDataDir() string {
 	base := os.Getenv("LOCALAPPDATA")
 	if base == "" {
 		base, _ = os.UserCacheDir()
 	}
-	dir := filepath.Join(base, "LaMaWatermarkRemover", "workspace")
+	dir := filepath.Join(base, "LaMaWatermarkRemover")
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
 }

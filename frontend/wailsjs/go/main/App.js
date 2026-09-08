@@ -18,6 +18,10 @@ export function DownloadSocial(arg1) {
   return window['go']['main']['App']['DownloadSocial'](arg1);
 }
 
+export function GetDouyinCookie() {
+  return window['go']['main']['App']['GetDouyinCookie']();
+}
+
 export function GetImageBase64(arg1, arg2) {
   return window['go']['main']['App']['GetImageBase64'](arg1, arg2);
 }
@@ -40,6 +44,10 @@ export function PickSaveFile(arg1) {
 
 export function PrepareSubset(arg1) {
   return window['go']['main']['App']['PrepareSubset'](arg1);
+}
+
+export function SetDouyinCookie(arg1) {
+  return window['go']['main']['App']['SetDouyinCookie'](arg1);
 }
 
 export function StartBatch(arg1, arg2, arg3) {

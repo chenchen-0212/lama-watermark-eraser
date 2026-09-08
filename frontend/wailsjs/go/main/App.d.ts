@@ -11,6 +11,8 @@ export function DetectURL(arg1:string):Promise<string>;
 
 export function DownloadSocial(arg1:string):Promise<downloader.Post>;
 
+export function GetDouyinCookie():Promise<string>;
+
 export function GetImageBase64(arg1:string,arg2:number):Promise<string>;
 
 export function GetThumb(arg1:string,arg2:number):Promise<main.ThumbInfo>;
@@ -22,6 +24,8 @@ export function PickDirectory():Promise<string>;
 export function PickSaveFile(arg1:string):Promise<string>;
 
 export function PrepareSubset(arg1:Array<string>):Promise<string>;
+
+export function SetDouyinCookie(arg1:string):Promise<void>;
 
 export function StartBatch(arg1:string,arg2:string,arg3:main.TaskParams):Promise<void>;
 

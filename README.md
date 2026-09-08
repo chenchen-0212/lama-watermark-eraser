@@ -132,9 +132,19 @@ wails build -platform windows/amd64 -webview2 embed
 | --- | --- |
 | 微信公众号 | ✅ 完全可用（零配置） |
 | 小红书 | ⚠️ 解析链路已验证；图文下载需 App「分享→复制链接」的最新链接（xsec_token 约 5 分钟有效） |
-| 抖音 | ⚠️ 风控较强，分享页接口不稳定，失败时给出可读提示，建议用本地文件夹模式 |
+| 抖音 | ⚠️ 风控较强；支持 `/note/{id}`、`/video/{id}` 与 `?modal_id={id}` 形态，**建议配置 Cookie 提高成功率**（见下） |
 | 视频链接 | 🚫 自动识别并提示不支持（仅支持图文） |
 | 本地文件夹 | ✅ 完全可用 |
+
+### 抖音 Cookie 配置（可选，推荐）
+
+抖音对未登录请求风控较强，容易失败。在初始页点击「🍪 抖音 Cookie 设置」，按弹窗指引复制浏览器 Cookie 即可：
+
+1. 用浏览器打开 `www.douyin.com` 并登录；
+2. `F12` → Network 标签 → 刷新页面 → 点第一个请求；
+3. 在 Request Headers 中找到 `Cookie`，复制完整值粘贴保存。
+
+Cookie 仅保存在本机 `%LOCALAPPDATA%\LaMaWatermarkRemover\douyin_cookie.txt`，不会上传到任何服务器。
 
 ## 512 适配策略
 

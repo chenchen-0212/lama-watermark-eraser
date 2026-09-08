@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -35,6 +36,33 @@ func SetPlatformCookie(platform, raw string) { platformCookies[platform] = raw }
 // PlatformCookie 读取平台 Cookie。
 func PlatformCookie(platform string) string { return platformCookies[platform] }
 
+// platformFromURL 根据 URL 主机名映射平台标识，用于按平台注入 Cookie。
+// 未匹配任何已知平台时返回空串（不注入）。
+func platformFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	switch {
+	case strings.Contains(host, "douyin"),
+		strings.Contains(host, "zjcdn"),     // 抖音图片 CDN
+		strings.Contains(host, "byteimg"),   // 抖音图片 CDN
+		strings.Contains(host, "douyinpic"),
+		strings.Contains(host, "douyinvod"):
+		return "douyin"
+	case strings.Contains(host, "xiaohongshu"),
+		strings.Contains(host, "xhscdn"):
+		return "xhs"
+	case strings.Contains(host, "weixin"),
+		strings.Contains(host, "qq.com"),
+		strings.Contains(host, "qpic.cn"):
+		return "wechat"
+	default:
+		return ""
+	}
+}
+
 func newRequest(ctx context.Context, url, referer, ua string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -48,6 +76,12 @@ func newRequest(ctx context.Context, url, referer, ua string) (*http.Request, er
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 	if referer != "" {
 		req.Header.Set("Referer", referer)
+	}
+	// 按平台注入用户配置的 Cookie（抖音等平台风控必需 ttwid 等凭据）
+	if p := platformFromURL(url); p != "" {
+		if c := PlatformCookie(p); c != "" {
+			req.Header.Set("Cookie", c)
+		}
 	}
 	return req, nil
 }

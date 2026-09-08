@@ -11,35 +11,59 @@ import (
 )
 
 var (
-	douyinIDRe = regexp.MustCompile(`/(?:video|note|slides)/(\d+)`)
-	routerRe   = regexp.MustCompile(`window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>`)
+	douyinIDRe      = regexp.MustCompile(`/(?:video|note|slides)/(\d+)`)
+	douyinModalIDRe = regexp.MustCompile(`[?&]modal_id=(\d+)`)
+	routerRe        = regexp.MustCompile(`window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>`)
 )
 
-// DownloadDouyin 下载抖音图文（无签名方案：iesdouyin 分享页 _ROUTER_DATA 解析）。
-// 注：抖音风控较强，分享页接口失效时会返回可读错误提示。
+// douyinAwemeID 从抖音链接中提取作品 ID。
+// 支持 /video/{id}、/note/{id}、/slides/{id} 路径形态与 ?modal_id={id} 弹窗形态
+// （后者常见于从抖音 Web 端复制的链接，modal_id 位于 RawQuery 而非 Path）。
+func douyinAwemeID(u string) string {
+	if m := douyinModalIDRe.FindStringSubmatch(u); m != nil {
+		return m[1]
+	}
+	if m := douyinIDRe.FindStringSubmatch(u); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// douyinEndpoint 单个解析端点及其所需 UA。
+type douyinEndpoint struct {
+	url string
+	ua  string
+}
+
+// DownloadDouyin 下载抖音图文。
+// 解析策略（无签名方案）：优先请求新版桌面页 www.douyin.com/note|video/{id}
+// （页面内含 window._ROUTER_DATA，但需要 ttwid 等 Cookie，未配置 Cookie 时可能被风控拦截），
+// 失败后回落旧版 iesdouyin.com/share/* 分享页。
 func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 	if isDouyinVideoURL(url) {
 		return nil, ErrVideoNotSupported
 	}
-	id := ""
-	if m := douyinIDRe.FindStringSubmatch(url); m != nil {
-		id = m[1]
-	}
+	id := douyinAwemeID(url)
 	if id == "" {
-		return nil, fmt.Errorf("无法从抖音链接解析作品 ID，请使用作品详情页链接")
+		return nil, fmt.Errorf("无法从抖音链接解析作品 ID，请使用作品详情页链接（支持 /note/{id}、/video/{id} 或 ?modal_id={id} 形态）")
+	}
+
+	endpoints := []douyinEndpoint{
+		// 新版桌面页（需 Cookie + 桌面 UA）
+		{url: "https://www.douyin.com/note/" + id, ua: BrowserUA},
+		{url: "https://www.douyin.com/video/" + id, ua: BrowserUA},
+		// 旧版分享页（移动 UA，已部分失效，保留兜底）
+		{url: "https://www.iesdouyin.com/share/note/" + id, ua: MobileUA},
+		{url: "https://www.iesdouyin.com/share/slides/" + id, ua: MobileUA},
+		{url: "https://www.iesdouyin.com/share/video/" + id, ua: MobileUA},
 	}
 
 	var item gjson.Result
-	// 依序尝试两个分享页端点（图文优先 note 端点）
-	for _, u := range []string{
-		"https://www.iesdouyin.com/share/note/" + id,
-		"https://www.iesdouyin.com/share/slides/" + id,
-		"https://www.iesdouyin.com/share/video/" + id,
-	} {
+	for _, ep := range endpoints {
 		if ctx.Err() != nil {
 			break
 		}
-		html, _, err := httpGet(ctx, u, "https://www.douyin.com/", MobileUA)
+		html, _, err := httpGet(ctx, ep.url, "https://www.douyin.com/", ep.ua)
 		if err != nil {
 			continue
 		}
@@ -53,8 +77,15 @@ func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 		}
 	}
 	if !item.Exists() {
-		return nil, fmt.Errorf("抖音分享页接口未能返回作品数据（风控或接口变更）。" +
-			"建议：直接保存图片后使用「本地文件夹」模式去水印")
+		msg := "抖音页面未能返回作品数据（可能被风控拦截或接口变更）。" +
+			"建议：① 点击初始页「抖音 Cookie」按指引配置浏览器登录 Cookie 后重试；" +
+			"② 或直接保存图片后使用「本地文件夹」模式去水印"
+		if PlatformCookie("douyin") == "" {
+			msg = "抖音页面未能返回作品数据（当前未配置 Cookie，容易被风控拦截）。" +
+				"建议：点击初始页「抖音 Cookie」按钮，按指引配置浏览器登录 Cookie 后重试；" +
+				"或直接保存图片后使用「本地文件夹」模式去水印"
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	author := item.Get("author.nickname").String()
@@ -106,8 +137,15 @@ func findDouyinItem(root gjson.Result, id string) gjson.Result {
 	if !loader.Exists() {
 		return gjson.Result{}
 	}
-	// 优先精确键 note_{id}/page 或 video_{id}/page
-	for _, prefix := range []string{"note_" + id + "/page", "video_" + id + "/page", "slides_" + id + "/page"} {
+	// 优先精确键。新版桌面页键名形如 "note_(id)/page"（id 带括号），
+	// 旧版分享页为 "note_{id}/page"（无括号），两种都试。
+	for _, prefix := range []string{
+		"note_(" + id + ")/page",
+		"note_" + id + "/page",
+		"video_(" + id + ")/page",
+		"video_" + id + "/page",
+		"slides_" + id + "/page",
+	} {
 		if v := loader.Get(fmt.Sprintf(`"%s".videoInfoRes.item_list.0`, prefix)); v.Exists() {
 			return v
 		}
