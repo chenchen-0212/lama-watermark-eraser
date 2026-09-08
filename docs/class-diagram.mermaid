@@ -1,0 +1,69 @@
+classDiagram
+    class TaskParams {
+        +Boxes [][4]float64
+        +Relative bool
+        +Dilate int
+        +Margin int
+        +MaskPath string
+        +Strategy string
+    }
+    class Result {
+        +Name string
+        +Status string
+        +Info string
+    }
+    class PythonEngine {
+        -exe string
+        -cmd *exec.Cmd
+        -stdin io.WriteCloser
+        -stdout *bufio.Reader
+        -stderr *safeBuffer
+        -mu sync.Mutex
+        -seq int64
+        -ready bool
+        +NewPythonEngine(exe string) *PythonEngine
+        +Start(ctx context.Context) error
+        +Infer(ctx context.Context, rgb []byte, mask []byte, w int, h int) ([]byte, error)
+        +Kill() error
+        +Close() error
+        +IsReady() bool
+    }
+    class Protocol {
+        +type Request struct
+        +type Response struct
+        +type Error struct
+        +EncodeRequest(r Request) []byte
+        +DecodeResponse(line []byte) (Response, error)
+        +NRGBAToRGB(img *image.NRGBA) ([]byte, int, int)
+        +RGBToNRGBA(rgb []byte, w int, h int) *image.NRGBA
+    }
+    class App {
+        -ctx context.Context
+        -engineExe string
+        -engine *PythonEngine
+        -cancel context.CancelFunc
+        +StartBatch(inDir string, outDir string, p TaskParams) error
+        +CancelBatch() error
+        +ensureEngine() (*PythonEngine, error)
+    }
+    class pipeline {
+        +InpaintImage(e *PythonEngine, img *image.NRGBA, mask []byte, margin int, strategy string) error
+        +ProcessBatch(e *PythonEngine, files []string, outDir string, params TaskParams, cb ProgressFn, ctx context.Context) []Result
+        +processOne(e *PythonEngine, path string, outDir string, params TaskParams, ctx context.Context) Result
+    }
+    class PythonWorker {
+        +model torch.jit.ScriptModule
+        +load_model(path string) void
+        +norm_img(arr) ndarray
+        +pad_img_to_modulo(img, mod) ndarray
+        +forward(image, mask) ndarray
+        +run_loop() void
+    }
+
+    App "1" --> "1" PythonEngine
+    PythonEngine --> Protocol
+    App --> TaskParams
+    pipeline --> PythonEngine
+    pipeline --> TaskParams
+    pipeline --> Result
+    PythonEngine ..> PythonWorker : stdin/stdout JSONL

@@ -1,0 +1,51 @@
+sequenceDiagram
+    autonumber
+    participant UI as Vue 前端
+    participant App as App(Wails绑定)
+    participant P as PythonEngine(Go)
+    participant PY as lamacore.exe(Python)
+    participant FS as 文件系统
+
+    Note over App,PY: ① 启动预热
+    App->>App: startup(ctx) 后台 goroutine
+    App->>P: ensureEngine() → NewPythonEngine(exe)
+    P->>P: exec.Command(lamacore.exe, --model …)
+    P->>PY: 启动子进程(stdin/stdout/stderr 管道)
+    P->>PY: {"type":"hello","id":1}
+    PY->>PY: torch.jit.load(big-lama.pt, map_location=cpu); model.eval()
+    PY-->>P: {"type":"hello","id":1,"ok":true,"data":{"status":"ready"}}
+    P-->>App: ready=true
+    App->>UI: emit engine:status {state:"ready"}
+
+    Note over UI,PY: ② 批量去水印
+    UI->>App: StartBatch(inDir, outDir, params)
+    App->>P: ensureEngine()（已就绪直接复用）
+    App->>App: CollectImages + prepareOutputDir
+    App->>P: ProcessBatch(files, params, cb, ctx)
+    loop 每张图片 i=1..N
+        P->>FS: DecodeImage(path) → NRGBA
+        P->>P: 构建 mask（多框 OR 合成 / MaskFromFile）
+        P->>P: 按 strategy 计算裁剪区(original=整图 / crop=bbox+margin)
+        P->>P: NRGBAToRGB + base64
+        P->>PY: {"type":"infer","id":N,"payload":{w,h,image_b64,mask_b64}}
+        PY->>PY: norm_img + pad_mod8 + mask>0 + no_grad forward + clip(*255)
+        PY-->>P: {"type":"infer","id":N,"ok":true,"data":{w,h,image_b64}}
+        P->>P: RGBToNRGBA + pasteInto（非 mask 区原像素不变）
+        P->>FS: SaveImage(UniqueDst)
+        P-->>App: cb(i,total,name,status,info)
+        App->>UI: emit batch:progress
+    end
+    App->>UI: emit batch:done {ok,total,outDir,canceled}
+
+    Note over App,PY: ③ 取消
+    UI->>App: CancelBatch()
+    App->>App: cancel() → ctx done
+    P->>P: Infer 检测 ctx 取消 → Kill()（taskkill /F /T /PID）
+    P-->>App: 返回 canceled 错误
+    P->>P: 当前张标记 skip；剩余张 skip（落盘前检查点不写盘）
+    App->>UI: emit batch:done {canceled:true}
+
+    Note over P,PY: ④ 单张失败不中断
+    P->>PY: {"type":"infer",...}
+    PY-->>P: {"type":"infer","ok":false,"error":{"code":"INFER_FAILED","message":"..."}}
+    P->>P: 记录 Result{status:fail}，continue 下一张
