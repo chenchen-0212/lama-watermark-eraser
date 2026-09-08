@@ -14,3 +14,6 @@ Thumbs.db
 # Python 引擎
 __pycache__/
 *.pyc
+python_engine/venv/
+python_engine/build/
+python_engine/dist/

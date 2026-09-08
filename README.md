@@ -4,15 +4,16 @@
 
 **输入链接或文件夹 → 下载/识别图片（视频自动拦截）→ 预览并框选水印 → 批量去水印 → 结果预览 → 导出 zip**
 
-> 技术栈：Go 1.25 + Wails v2.15 + Vue 3 + onnxruntime_go（LaMa ONNX CPU 推理）
+> 技术栈：Go 1.25 + Wails v2.15 + Vue 3 + Python(big-lama PyTorch) 常驻子进程引擎（IOPaint 对齐）
 > 上游：[advimman/lama](https://github.com/advimman/lama)（Apache-2.0）· 下载能力设计参考 [zinan92/content-downloader](https://github.com/zinan92/content-downloader)（MIT）
 
 ## 功能特性
 
 - **社媒图文下载**：支持微信公众号文章、小红书图文、抖音图文（纯 Go 原生实现，零 Python 依赖）
 - **本地文件夹模式**：无需链接，直接选择本机文件夹，识别并批量去水印
-- **多水印区域框选**：可拖拽框选多个水印区域，逐个独立修复；支持绝对位置 / 按比例适配两种定位
-- **LaMa 批量修复**：ONNX CPU 推理，单张约 2–4 秒；≤512px 原生分辨率，>512px 等比缩放
+- **多水印区域框选**：可拖拽框选多个水印区域，合并为单掩膜整图推理；支持绝对位置 / 按比例适配两种定位
+- **LaMa 批量修复**：big-lama PyTorch 权重 CPU 推理（与 IOPaint 输出逐像素对齐），原生分辨率、无缩放；`--fast` 逐框裁剪模式大图更快
+- **引擎状态可视**：启动期自动预热并推送状态（starting/ready/error），未就绪时禁用消除按钮
 - **批量 / 勾选处理**：全部处理或仅处理勾选图片
 - **结果预览与导出**：左右滑动预览、点击放大，一键导出 zip 压缩包
 - **视频链接拦截**：自动识别视频链接并提示不支持（仅支持图文）
@@ -42,8 +43,8 @@
 ## 目录结构
 
 ```
-├── main.go                  # CLI/GUI 分流；资源解压；WebView2 数据目录
-├── app.go                   # Wails 绑定 + 流水线调度 + 事件
+├── main.go                  # CLI/GUI 分流；WebView2 数据目录
+├── app.go                   # Wails 绑定 + 流水线调度 + engine:status 事件
 ├── internal/
 │   ├── downloader/          # 纯 Go 社媒图文下载器
 │   │   ├── router.go        # 平台识别 / 短链展开 / 视频拦截
@@ -51,15 +52,31 @@
 │   │   ├── xhs.go           # 小红书 __INITIAL_STATE__ 解析（含视频拦截）
 │   │   ├── douyin.go        # 抖音分享页解析
 │   │   └── httpclient.go    # UA/Referer/Cookie/防盗链
-│   ├── inpaint/             # LaMa 去水印引擎
-│   │   ├── model.go         # onnxruntime_go 会话；固定 512 画布；NCHW
-│   │   └── pipeline.go      # 批量调度 / 掩膜 / 多框修复
+│   ├── inpaint/             # 去水印引擎客户端与流水线
+│   │   ├── python_client.go # Python 子进程 JSONL 客户端（进程树管理/超时/懒重启）
+│   │   ├── protocol.go      # JSONL 信封与 RGB888 编解码
+│   │   ├── pipeline.go      # 批量调度 / 掩膜 / original|crop 策略
+│   │   └── engine.go        # 引擎工厂（伴生 lamacore 或开发期环境变量）
 │   ├── ziputil/             # 结果打包
 │   └── cli/                 # 命令行模式
-├── resources/               # go:embed 运行时与模型（Git LFS 管理）
-│   ├── onnxruntime.dll      # ONNX 运行时（16MB）
-│   └── lama_fp32.onnx       # LaMa 模型权重（199MB）
+├── python_engine/           # big-lama 推理引擎（PyInstaller 打包为 lamacore/）
+│   ├── inpaint_core.py      # IOPaint 对齐核心（pad mod8 symmetric / norm / forward）
+│   ├── worker.py            # stdin/stdout JSONL 常驻子进程
+│   ├── lamacore.spec        # PyInstaller onedir 配置
+│   ├── align_smoke.py       # 打包前像素级对齐自测
+│   ├── build_engine.bat     # 一键构建脚本
+│   └── requirements.txt     # 依赖（torch CPU / numpy / pillow）
 └── frontend/                # Vue3 流水线界面（Apple 流体设计）
+```
+
+最终发布产物布局（lamacore 与主程序同目录分发）：
+
+```
+社媒图文水印抹除工具.exe
+lamacore/
+├── lamacore.exe             # 引擎入口（console 子进程，stdin/stdout JSONL）
+└── _internal/               # torch / numpy / 引擎脚本
+    └── models/big-lama.pt   # 权重（205MB，随包分发）
 ```
 
 ## 构建
@@ -68,21 +85,31 @@
 
 - Go 1.25+
 - [Wails CLI](https://wails.io) v2
-- MinGW-w64（cgo 编译，用于 onnxruntime_go）
+- MinGW-w64（cgo 编译）
 - Node 18+
-- Git LFS（拉取大文件）
+- Python 3.10（优先）或 3.12（打包 lamacore 引擎用；降级路径详见下文）
 
-### 拉取仓库（含模型）
+### 拉取仓库
 
 ```bash
-# 模型与运行时由 Git LFS 托管，clone 时需拉取 LFS 对象
-git lfs install
 git clone https://github.com/chenchen-0212/lama-watermark-eraser.git
 cd lama-watermark-eraser
-git lfs pull
 ```
 
-### 编译打包
+### 编译 AI 引擎（lamacore）
+
+```bat
+cd python_engine
+build_engine.bat
+```
+
+脚本行为：建 venv（优先 Python 3.10 + torch 2.2.2 CPU；本机无 3.10 时按终裁降级为
+Python 3.12 + 系统 torch，venv 以 `--system-site-packages` 复用已装 torch，并在脚本头注释注明）
+→ 安装依赖与 pyinstaller → 先跑 `align_smoke.py` 像素级对齐自测（不过不许打包）
+→ PyInstaller onedir 打包（权重经 `LAMA_MODEL_SRC` 注入，缺省
+`D:\clear_mask\lama\watermark_tool\models\big-lama.pt`）→ 产出 `python_engine\dist\lamacore\`。
+
+### 编译主程序
 
 ```bash
 # Windows（需 MinGW-w64，CC 使用 Windows 绝对路径）
@@ -91,7 +118,21 @@ export CGO_ENABLED=1
 export PATH="/d/mingw64/bin:$PATH"
 wails build -platform windows/amd64 -webview2 embed
 
-# 产物：build/bin/社媒图文水印抹除工具.exe（单文件，内嵌模型与运行时）
+# 产物：build/bin/社媒图文水印抹除工具.exe
+# 分发：把 python_engine/dist/lamacore 整目录复制到 build/bin/ 下（与主 exe 同级）
+```
+
+主程序启动时按 `exe 同级 lamacore/lamacore.exe` → `exe 同级 lamacore.exe` → cwd 同规则
+自动定位引擎；找不到时经 `engine:status` 事件报可读错误（不 panic）。
+
+### 开发期（不打包，直接驱动本机 Python）
+
+设置环境变量后，主程序/CLI 会跳过 lamacore 定位，直接用指定 Python 运行 worker.py：
+
+```bash
+export LAMA_ENGINE_PYTHON='C:\path\to\python.exe'   # 需已装 torch/numpy
+export LAMA_ENGINE_WORKER='D:\repo\python_engine\worker.py'   # 缺省 <cwd>/python_engine/worker.py
+export LAMA_ENGINE_MODEL='D:\path\to\big-lama.pt'   # 缺省由 worker 自动定位
 ```
 
 ## 使用说明
@@ -121,6 +162,7 @@ wails build -platform windows/amd64 -webview2 embed
 可选参数：
   --dilate N       掩膜边缘外扩（默认 12）
   --margin N       修复上下文边距（默认 64）
+  --fast           快速模式：逐框裁剪推理（大图更快；默认整图推理效果更佳）
   --mask file.png  不规则水印掩膜（白色=水印区域）
   --recursive      递归子文件夹
   --zip            完成后自动打包 zip
@@ -146,9 +188,19 @@ wails build -platform windows/amd64 -webview2 embed
 
 Cookie 仅保存在本机 `%LOCALAPPDATA%\LaMaWatermarkRemover\douyin_cookie.txt`，不会上传到任何服务器。
 
-## 512 适配策略
+## 引擎与对齐说明
 
-ONNX 版 `lama_fp32` 固定 512×512 输入（batch 维动态）。裁剪 ≤512 时反射填充到 512（原生分辨率，不缩放）；裁剪 >512 时等比缩放到 512 内切，推理后缩回贴回。
+引擎为 [big-lama](https://github.com/advimman/lama) PyTorch JIT 权重（`big-lama.pt`），
+经 Python 常驻子进程推理，Go 侧经 stdin/stdout JSONL 协议通信（半双工同步 + stderr
+排空 + 进程树管理）。推理实现逐行对齐 IOPaint `LaMa.forward` 语义：
+
+- 输入整图 RGB888 + 单通道 0/255 掩膜，**无缩放无 512 画布**（原生分辨率）
+- 四边 `np.pad(mode="symmetric")` 填充到 8 的倍数（IOPaint `_pad_forward` 同款）
+- 归一化 /255 → CHW；mask `(m>0)*1` int64；`torch.no_grad()` 前向；输出 `clip(0,255)` 后裁回原尺寸
+- 贴回仅覆写掩膜区，非掩膜区像素保持原图不变
+
+打包前 `python_engine/align_smoke.py` 会以独立参考实现逐像素比对 worker 推理路径
+（覆盖奇数 / 非 8 对齐尺寸，断言 max diff ≤ 1），对齐不过不许出包。
 
 ## 版权与免责声明
 

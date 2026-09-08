@@ -202,7 +202,10 @@ class Worker:
 
 def main():
     ap = argparse.ArgumentParser(description="big-lama 去水印引擎常驻子进程")
-    ap.add_argument("--model", default=None, help="big-lama.pt 路径（缺省自动定位）")
+    # 模型路径回退链：--model 显式参数 -> 环境变量 LAMA_ENGINE_MODEL ->
+    # 打包内相对路径（_MEIPASS/exe 同级/_internal/models 等，见 _resolve_model_path）
+    ap.add_argument("--model", default=os.environ.get("LAMA_ENGINE_MODEL"),
+                    help="big-lama.pt 路径（缺省先读 LAMA_ENGINE_MODEL，再自动定位）")
     ap.add_argument("--device", default="cpu", help="推理设备（当前仅 cpu）")
     ap.add_argument("--num-threads", type=int, default=0,
                     help="torch 线程数（0=系统默认）")
