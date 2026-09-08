@@ -3,7 +3,6 @@ package main
 import (
 	"embed"
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 
 	"lama-watermark-eraser/internal/cli"
-	"lama-watermark-eraser/resources"
 )
 
 //go:embed all:frontend/dist
@@ -34,12 +32,9 @@ func main() {
 		}
 	}
 
-	// 首启解压内嵌资源（onnxruntime + LaMa 模型）
-	dllPath, modelPath, err := resources.EnsureAssets()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "资源初始化失败:", err)
-		os.Exit(1)
-	}
+	// 引擎资源说明：ONNX 内嵌资源已移除，改为伴生 lamacore/lamacore.exe
+	// （Python big-lama 子进程，见 resources.LocatePythonEngine）。
+	// 引擎定位与预热在 app.startup 中后台完成，状态经 engine:status 事件推送前端。
 
 	// WebView2 用户数据目录显式指定，避免 APPDATA 缺失/受限环境下的创建失败
 	wvDataDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "LaMaWatermarkRemover", "webview2")
@@ -48,9 +43,9 @@ func main() {
 	}
 	_ = os.MkdirAll(wvDataDir, 0o755)
 
-	app := NewApp(dllPath, modelPath)
+	app := NewApp()
 
-	err = wails.Run(&options.App{
+	err := wails.Run(&options.App{
 		Title:     "社媒图文去水印工作台",
 		Width:     1080,
 		Height:    760,

@@ -13,17 +13,10 @@ import (
 	"lama-watermark-eraser/internal/downloader"
 	"lama-watermark-eraser/internal/inpaint"
 	"lama-watermark-eraser/internal/ziputil"
-	"lama-watermark-eraser/resources"
 )
 
 // Run 执行 CLI 并决定进程退出码（全成功 0，有失败 2，参数/资源错误 1 或 2）。
 func Run(args []string) {
-	dllPath, modelPath, err := resources.EnsureAssets()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "资源初始化失败:", err)
-		os.Exit(1)
-	}
-
 	fs := flag.NewFlagSet("LaMaWatermarkRemover", flag.ExitOnError)
 	urlFlag := fs.String("url", "", "社媒图文链接（先下载图片再可继续去水印）")
 	input := fs.String("input", "", "输入图片文件夹")
@@ -35,10 +28,11 @@ func Run(args []string) {
 	mask := fs.String("mask", "", "掩膜 PNG（白色=水印区域）")
 	dilate := fs.Int("dilate", 12, "掩膜边缘外扩像素")
 	margin := fs.Int("margin", 64, "修复上下文边距")
+	fast := fs.Bool("fast", false, "快速模式：逐框裁剪推理（大图更快；默认整图推理效果更佳）")
 	recursive := fs.Bool("recursive", false, "递归子文件夹")
 	zipOut := fs.Bool("zip", false, "完成后打包 zip（输出目录旁生成 .zip）")
 	_ = fs.String("device", "", "兼容参数（当前仅 CPU）")
-	_ = fs.String("model", "", "兼容参数（当前使用内置模型）")
+	_ = fs.String("model", "", "兼容参数（模型路径由伴生引擎决定）")
 	_ = fs.Parse(args)
 
 	ctx := context.Background()
@@ -80,6 +74,10 @@ func Run(args []string) {
 	params.Dilate = *dilate
 	params.Margin = *margin
 	params.MaskPath = *mask
+	if *fast {
+		params.Strategy = inpaint.StrategyCrop
+	}
+	var err error
 	boxSpec := 0
 	switch {
 	case *box != "":
@@ -128,13 +126,26 @@ func Run(args []string) {
 		os.Exit(2)
 	}
 
-	fmt.Printf("待处理: %d 张 | 加载模型…\n", len(files))
-	engine, err := inpaint.NewEngine(modelPath, dllPath)
+	fmt.Printf("待处理: %d 张 | 启动引擎…\n", len(files))
+	engine, err := inpaint.NewEngine()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer engine.Close()
+	if err := engine.Start(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "引擎启动失败:", err)
+		if lines := engine.LastStderr(); len(lines) > 0 {
+			if len(lines) > 10 {
+				lines = lines[len(lines)-10:]
+			}
+			fmt.Fprintln(os.Stderr, "引擎日志（最近）:")
+			for _, l := range lines {
+				fmt.Fprintln(os.Stderr, "  "+l)
+			}
+		}
+		os.Exit(1)
+	}
 
 	t0 := time.Now()
 	results := inpaint.ProcessBatch(engine, files, *output, params,

@@ -10,3 +10,7 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 *.log
+
+# Python 引擎
+__pycache__/
+*.pyc

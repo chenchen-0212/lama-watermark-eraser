@@ -66,6 +66,20 @@ func MaskFromFile(path string, w, h int) ([]byte, error) {
 	return mask, nil
 }
 
+// MergeMasks 将 src 掩膜按「或」合并进 dst（任一非零即为 255）。
+// 用于多框选 original 策略：逐框生成掩膜后合并为单张掩膜，整图单次前向。
+// 长度不符时静默返回（调用方均为内部固定 W*H 数据流，不应触发）。
+func MergeMasks(dst, src []byte, w, h int) {
+	if len(dst) != w*h || len(src) != w*h {
+		return
+	}
+	for i, v := range src {
+		if v > 0 {
+			dst[i] = 255
+		}
+	}
+}
+
 // DilateRegion 对掩膜中包围盒 (bx1,by1,bx2,by2) 区域做 MaxFilter(2d+1) 膨胀，
 // 等价于 PIL ImageFilter.MaxFilter，仅处理框附近子区域以保证大图性能。
 func DilateRegion(mask []byte, w, h int, bx1, by1, bx2, by2, d int) {

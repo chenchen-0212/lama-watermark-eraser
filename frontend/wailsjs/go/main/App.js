@@ -22,6 +22,10 @@ export function GetDouyinCookie() {
   return window['go']['main']['App']['GetDouyinCookie']();
 }
 
+export function GetEngineStatus() {
+  return window['go']['main']['App']['GetEngineStatus']();
+}
+
 export function GetImageBase64(arg1, arg2) {
   return window['go']['main']['App']['GetImageBase64'](arg1, arg2);
 }

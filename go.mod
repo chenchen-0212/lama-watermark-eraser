@@ -6,7 +6,6 @@ require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/tidwall/gjson v1.14.2
 	github.com/wailsapp/wails/v2 v2.15.0
-	github.com/yalue/onnxruntime_go v1.36.0
 	golang.org/x/image v0.41.0
 )
 

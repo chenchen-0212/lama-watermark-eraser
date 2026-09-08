@@ -145,6 +145,14 @@ export async function startBatch(scopeAll = true) {
     showToast('请先在预览图上拖拽框选水印区域')
     return
   }
+  if (store.engineStatus === 'starting') {
+    showToast('AI 引擎正在启动，请稍候…', 'info')
+    return
+  }
+  if (store.engineStatus === 'error') {
+    showToast('AI 引擎未就绪：' + (store.engineMessage || '启动失败'), 'danger')
+    return
+  }
   store.running = true
   store.canceling = false
   store.stage = 'inpainting'
@@ -160,12 +168,13 @@ export async function startBatch(scopeAll = true) {
     const outDir = inDir + '_去水印'
     store.cleanedDir = outDir
     await StartBatch(inDir, outDir, {
-      boxes, relative, dilate: store.dilate, margin: 64, maskPath: '',
+      boxes, relative, dilate: store.dilate, margin: 64, maskPath: '', strategy: 'original',
     })
   } catch (e) {
     log('启动失败: ' + e, 'fail')
     showToast(String(e))
     store.running = false
+    store.canceling = false
     store.stage = 'downloaded'
   }
 }
@@ -257,7 +266,29 @@ export function initEvents() {
       store.stage = 'downloaded'
     }
   })
-  EventsOn('pipe:error', (d) => showToast(d.msg))
+  // 引擎状态事件 -> 全局状态 + 日志（error 弹提示，ready/starting 记录日志）
+  EventsOn('engine:status', (d) => {
+    store.engineStatus = d.state
+    store.engineMessage = d.message || ''
+    if (d.state === 'ready') {
+      log(d.message || 'AI 引擎已就绪', 'ok')
+    } else if (d.state === 'error') {
+      log('AI 引擎错误: ' + d.message, 'fail')
+      showToast('AI 引擎错误: ' + d.message, 'danger')
+    } else {
+      log(d.message || 'AI 引擎启动中…')
+    }
+  })
+
+  // 启动时主动同步一次引擎状态（弥补订阅建立前错过的事件）
+  GetEngineStatus()
+    .then((d) => {
+      if (d && d.state) {
+        store.engineStatus = d.state
+        store.engineMessage = d.message || ''
+      }
+    })
+    .catch(() => {})
 }
 
 // ---------------- 绑定辅助（目录列表经 PrepareSubset/zip 之外需要列目录） ----------------

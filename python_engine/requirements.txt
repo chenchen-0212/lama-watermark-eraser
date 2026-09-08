@@ -1,0 +1,17 @@
+# big-lama 去水印引擎（Python 子进程）依赖
+# 运行时 Python 3.10~3.12（torch 2.2.2 CPU wheel 兼容范围；3.13 需 torch>=2.5，不在本清单范围）
+
+# PyTorch CPU 版。主理人决策：2.2.2 起步（若 torch.jit.load(big-lama.pt) 失败，
+# 按 2.0.x -> 1.13.1 顺序降级实测后回写本文件）。
+# Windows 上安装 CPU 版（避免默认拉取含 CUDA 依赖的 wheel）：
+#   pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2
+
+# 与 torch 2.2 匹配的 numpy；避免 numpy 2.0 的 ABI 破坏
+numpy==1.26.4
+
+# 仅开发/调试与可选 file_path 模式用；主链路不依赖 PIL 解码（由 Go 侧完成）
+pillow==10.3.0
+
+# 构建期额外（T05 PyInstaller 打包用，运行时不依赖）：
+# pyinstaller==6.6.0

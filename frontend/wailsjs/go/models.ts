@@ -35,6 +35,7 @@ export namespace main {
 	    dilate: number;
 	    margin: number;
 	    maskPath: string;
+	    strategy: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new TaskParams(source);
@@ -47,6 +48,7 @@ export namespace main {
 	        this.dilate = source["dilate"];
 	        this.margin = source["margin"];
 	        this.maskPath = source["maskPath"];
+	        this.strategy = source["strategy"];
 	    }
 	}
 	export class ThumbInfo {

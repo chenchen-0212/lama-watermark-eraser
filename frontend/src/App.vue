@@ -40,6 +40,9 @@ const pct = computed(() =>
     : 0
 )
 
+// AI 引擎未就绪（starting/error）期间禁用去水印按钮
+const engineReady = computed(() => store.engineStatus === 'ready')
+
 const urlRef = ref(null)
 const showNotice = ref(false)
 
@@ -598,6 +601,11 @@ function onKey(e) {
 .radio input { accent-color: var(--accent); }
 .num { width: 74px; padding: 7px 10px; }
 .tip { font-size: 11.5px; color: var(--text-3); }
+.engine-status {
+  margin-top: 6px;
+  color: var(--warn);
+  font-weight: 500;
+}
 
 .grid-wrap { padding: 16px; }
 .grid-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }

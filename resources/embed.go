@@ -1,17 +1,14 @@
-// Package resources 内嵌 onnxruntime 运行时与 LaMa 模型，首次运行解压到本地缓存目录。
+// Package resources 提供引擎可执行文件定位与资源版本标识。
 package resources
 
 import (
 	"embed"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-//go:embed onnxruntime.dll
-//go:embed lama_fp32.onnx
 //go:embed version.txt
 var files embed.FS
 
@@ -21,65 +18,30 @@ func Version() string {
 	return strings.TrimSpace(string(b))
 }
 
-// EnsureAssets 确保资源已解压到 %LOCALAPPDATA%\LaMaWatermarkRemover\<version>\。
-// 版本标记命中且文件有效时直接复用。返回 (dllPath, modelPath, err)。
-func EnsureAssets() (dllPath, modelPath string, err error) {
-	base := os.Getenv("LOCALAPPDATA")
-	if base == "" {
-		base, err = os.UserCacheDir()
-		if err != nil {
-			return "", "", err
+// LocatePythonEngine 定位伴生引擎可执行文件 lamacore/lamacore.exe。
+// 优先 os.Executable() 同级目录；缺失时返回可读错误。
+func LocatePythonEngine() (string, error) {
+	var candidates []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, "lamacore", "lamacore.exe"),
+			filepath.Join(dir, "lamacore.exe"),
+		)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(cwd, "lamacore", "lamacore.exe"),
+			filepath.Join(cwd, "lamacore.exe"),
+		)
+	}
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil
 		}
 	}
-	dir := filepath.Join(base, "LaMaWatermarkRemover", Version())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", err
-	}
-	dllPath = filepath.Join(dir, "onnxruntime.dll")
-	modelPath = filepath.Join(dir, "lama_fp32.onnx")
-	marker := filepath.Join(dir, "version.txt")
-	if fileOK(dllPath) && fileOK(modelPath) {
-		if b, e := os.ReadFile(marker); e == nil && string(b) == Version() {
-			return dllPath, modelPath, nil
-		}
-	}
-	pairs := []struct{ name, dst string }{
-		{"onnxruntime.dll", dllPath},
-		{"lama_fp32.onnx", modelPath},
-	}
-	for _, p := range pairs {
-		if err := extract(p.name, p.dst); err != nil {
-			return "", "", fmt.Errorf("解压资源 %s 失败: %w", p.name, err)
-		}
-	}
-	if err := os.WriteFile(marker, []byte(Version()), 0o644); err != nil {
-		return "", "", err
-	}
-	return dllPath, modelPath, nil
-}
-
-func fileOK(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && st.Size() > 0
-}
-
-func extract(name, dst string) error {
-	src, err := files.Open(name)
-	if err != nil {
-		return fmt.Errorf("内嵌资源缺失: %w", err)
-	}
-	defer src.Close()
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, src); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, dst)
+	return "", fmt.Errorf(
+		"未找到 AI 引擎可执行文件（应位于主程序同级的 lamacore/lamacore.exe）。已尝试: %s",
+		strings.Join(candidates, "; "),
+	)
 }
