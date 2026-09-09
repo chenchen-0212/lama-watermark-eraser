@@ -1,6 +1,11 @@
 # 构建产物
-build/
+build/*
 *.exe
+
+# 发布用安装器 exe 例外（经 Git LFS 入库）
+!build/installer/
+build/installer/*
+!build/installer/*.exe
 
 # 前端依赖与构建
 node_modules/
