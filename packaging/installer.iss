@@ -24,9 +24,15 @@ AppId={{8F7A2C90-5B1E-4C6D-9E3F-A1B2C3D4E5F6}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-; 默认安装目录用英文（与 %LOCALAPPDATA% 下应用数据目录同名）；
-; 已装旧中文目录的升级仍沿用旧目录（UsePreviousAppDir），卸载重装才落新默认目录。
+; 默认安装目录用英文（与 %LOCALAPPDATA% 下应用数据目录同名）。
+; UsePreviousAppDir=no：不沿用旧安装目录，「选择目标位置」页的初始路径
+; 固定为上述默认值（用户可改），不再预填旧安装目录。
+; DisableDirPage=no：目录页强制显示。Inno 默认 auto——只要检测到同 AppId
+; 的旧安装就跳过目录页（用户反馈「双击没有目录选择页」的根因），
+; 仅设 UsePreviousAppDir=no 不足以阻止跳页，两项必须同时设置。
 DefaultDirName={autopf}\LaMaWatermarkRemover
+UsePreviousAppDir=no
+DisableDirPage=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\build\installer
