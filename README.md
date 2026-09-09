@@ -7,15 +7,24 @@
 > 技术栈：Go 1.25 + Wails v2.15 + Vue 3 + Python(big-lama PyTorch) 常驻子进程引擎（IOPaint 对齐）
 > 上游：[advimman/lama](https://github.com/advimman/lama)（Apache-2.0）· 下载能力设计参考 [zinan92/content-downloader](https://github.com/zinan92/content-downloader)（MIT）
 
+## 下载安装（Windows）
+
+最新发布版：tag [`v1.1.1-installer`](https://github.com/chenchen-0212/lama-watermark-eraser/releases/tag/v1.1.1-installer)，安装包 `社媒图文水印抹除工具_Setup_1.1.1.exe`（约 300MB，经 Git LFS 分发，内含 big-lama 权重与完整引擎，无需额外下载模型）。
+
+- 双击安装即可，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限
+- 安装器提供中文界面，可自定义安装目录；含卸载入口
+- 兼容非 ASCII 安装路径；卸载/退出时自动回收引擎子进程
+
 ## 功能特性
 
 - **社媒图文下载**：支持微信公众号文章、小红书图文、抖音图文（纯 Go 原生实现，零 Python 依赖）
 - **本地文件夹模式**：无需链接，直接选择本机文件夹，识别并批量去水印
-- **多水印区域框选**：可拖拽框选多个水印区域，合并为单掩膜整图推理；支持绝对位置 / 按比例适配两种定位
-- **LaMa 批量修复**：big-lama PyTorch 权重 CPU 推理（与 IOPaint 输出逐像素对齐），原生分辨率、无缩放；`--fast` 逐框裁剪模式大图更快
+- **多水印区域框选**：可拖拽框选多个水印区域，合并为单掩膜推理；支持绝对位置 / 按比例适配两种定位
+- **智能推理策略**：默认 `auto` 按每张图水印占比自动选择整图推理（效果最佳）或逐框裁剪推理（大图更快）；GUI 可手动切换
+- **LaMa 批量修复**：big-lama PyTorch 权重 CPU 推理（与 IOPaint 输出逐像素对齐），原生分辨率、无缩放
 - **引擎状态可视**：启动期自动预热并推送状态（starting/ready/error），未就绪时禁用消除按钮
 - **批量 / 勾选处理**：全部处理或仅处理勾选图片
-- **结果预览与导出**：左右滑动预览、点击放大，一键导出 zip 压缩包
+- **结果预览与导出**：左右滑动预览、点击放大，一键导出 zip 压缩包；第 2 步还支持「源图打包」导出去水印前的原图
 - **视频链接拦截**：自动识别视频链接并提示不支持（仅支持图文）
 
 ## 工作流程
@@ -125,6 +134,19 @@ wails build -platform windows/amd64 -webview2 embed
 主程序启动时按 `exe 同级 lamacore/lamacore.exe` → `exe 同级 lamacore.exe` → cwd 同规则
 自动定位引擎；找不到时经 `engine:status` 事件报可读错误（不 panic）。
 
+### 打包 Windows 安装器（Inno Setup 6）
+
+```bat
+:: 先完成上述引擎与主程序编译，并确认 build/bin/ 下已就位主 exe 与 lamacore\ 目录
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
+:: 产物：build\installer\社媒图文水印抹除工具_Setup_<版本>.exe
+```
+
+安装脚本要点（详见 `packaging/installer.iss`）：按用户安装（`PrivilegesRequired=lowest`，
+默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`）、中文界面、目录页强制显示、
+非 ASCII 安装路径兼容；lamacore 整目录以 lzma2/max 压缩递归打包。
+版本号在 `installer.iss` 头部 `#define MyAppVersion` 统一维护。
+
 ### 开发期（不打包，直接驱动本机 Python）
 
 设置环境变量后，主程序/CLI 会跳过 lamacore 定位，直接用指定 Python 运行 worker.py：
@@ -141,9 +163,9 @@ export LAMA_ENGINE_MODEL='D:\path\to\big-lama.pt'   # 缺省由 worker 自动定
 
 双击 `社媒图文水印抹除工具.exe`，然后：
 
-1. **选择来源**：粘贴社媒图文链接点「下载图片」，或点「选择本地文件夹」直接处理本机图片
+1. **选择来源**：粘贴社媒图文链接点「下载图片」，或点「选择本地文件夹」直接处理本机图片；此步可用「⬇ 源图打包」把原图导出为 zip
 2. **框选水印**：在左侧大图上按住左键拖拽框选水印区域（可框选多个、拖动八向手柄调整大小）
-3. **批量去水印**：点「全部去水印」或「仅勾选(n)」，进度实时可见
+3. **批量去水印**：选择处理策略（默认「智能」自动权衡速度与效果，可切「整图」/「逐框裁剪」），点「全部去水印」或「仅勾选(n)」，进度实时可见
 4. **预览与导出**：点击图片放大查看，点「导出 zip 压缩包」选择保存位置
 
 ### 命令行模式
@@ -162,11 +184,16 @@ export LAMA_ENGINE_MODEL='D:\path\to\big-lama.pt'   # 缺省由 worker 自动定
 可选参数：
   --dilate N       掩膜边缘外扩（默认 12）
   --margin N       修复上下文边距（默认 64）
-  --fast           快速模式：逐框裁剪推理（大图更快；默认整图推理效果更佳）
+  --strategy S     处理策略：auto（智能，默认）| original（整图推理）| crop（逐框裁剪推理）
+  --fast           快速模式：等价 --strategy crop（两者不可同时使用）
   --mask file.png  不规则水印掩膜（白色=水印区域）
   --recursive      递归子文件夹
   --zip            完成后自动打包 zip
 ```
+
+> auto 策略规则：按合并掩膜 bbox 外扩 margin 后的面积占比判断——占比 ≤ 60% 走
+> crop（多次小前向更快），否则走 original（整图单次前向效果最佳）；裁剪上下文
+> 边距下限 256，对齐 IOPaint CROP 默认值。
 
 ## 平台支持
 
