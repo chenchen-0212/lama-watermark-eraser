@@ -10,6 +10,7 @@ import {
   PrepareSubset,
   PickDirectory,
   ListImages,
+  GetEngineStatus,
 } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 
@@ -26,6 +27,9 @@ export const store = reactive({
   boxes: [], // [[x1,y1,x2,y2], ...] 原图像素坐标（多个水印区域）
   ratios: [], // [[x1,y1,x2,y2], ...] 0..1 比例
   mode: 'relative', // absolute | relative（默认按比例适配，兼容不同尺寸图集）
+  strategy: 'auto', // 处理策略: auto(智能)|original(整图)|crop(快速裁剪)
+  engineStatus: 'idle', // AI 引擎状态机: idle | starting | ready | error
+  engineMessage: '',
   dilate: 12,
   logs: [],
   progress: { index: 0, total: 0, name: '', status: '' },
@@ -168,7 +172,7 @@ export async function startBatch(scopeAll = true) {
     const outDir = inDir + '_去水印'
     store.cleanedDir = outDir
     await StartBatch(inDir, outDir, {
-      boxes, relative, dilate: store.dilate, margin: 64, maskPath: '', strategy: 'original',
+      boxes, relative, dilate: store.dilate, margin: 64, maskPath: '', strategy: store.strategy,
     })
   } catch (e) {
     log('启动失败: ' + e, 'fail')

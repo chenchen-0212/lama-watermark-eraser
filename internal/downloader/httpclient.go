@@ -46,8 +46,8 @@ func platformFromURL(rawURL string) string {
 	host := strings.ToLower(u.Hostname())
 	switch {
 	case strings.Contains(host, "douyin"),
-		strings.Contains(host, "zjcdn"),     // 抖音图片 CDN
-		strings.Contains(host, "byteimg"),   // 抖音图片 CDN
+		strings.Contains(host, "zjcdn"),   // 抖音图片 CDN
+		strings.Contains(host, "byteimg"), // 抖音图片 CDN
 		strings.Contains(host, "douyinpic"),
 		strings.Contains(host, "douyinvod"):
 		return "douyin"

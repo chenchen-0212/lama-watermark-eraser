@@ -66,7 +66,7 @@ func Download(ctx context.Context, rawURL, outDir string) (*Post, error) {
 // isDouyinVideoURL 判断是否为明确的视频详情页链接（/video/{id}）。
 // 注意：?modal_id={id} 形态的 ID 在查询串中、无法从 URL 判断内容类型，
 // 因此不在此拦截——交由 DownloadDouyin 解析后按实际数据判定
-//（图文正常下载，视频内容因无 images 返回 ErrVideoNotSupported）。
+// （图文正常下载，视频内容因无 images 返回 ErrVideoNotSupported）。
 func isDouyinVideoURL(u string) bool {
 	p, err := url.Parse(u)
 	if err != nil {

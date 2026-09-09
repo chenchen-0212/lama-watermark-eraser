@@ -28,7 +28,8 @@ func Run(args []string) {
 	mask := fs.String("mask", "", "掩膜 PNG（白色=水印区域）")
 	dilate := fs.Int("dilate", 12, "掩膜边缘外扩像素")
 	margin := fs.Int("margin", 64, "修复上下文边距")
-	fast := fs.Bool("fast", false, "快速模式：逐框裁剪推理（大图更快；默认整图推理效果更佳）")
+	fast := fs.Bool("fast", false, "快速模式：逐框裁剪推理（等价 --strategy crop）")
+	strategy := fs.String("strategy", "auto", "处理策略: auto(智能)|original(整图)|crop(快速裁剪)")
 	recursive := fs.Bool("recursive", false, "递归子文件夹")
 	zipOut := fs.Bool("zip", false, "完成后打包 zip（输出目录旁生成 .zip）")
 	_ = fs.String("device", "", "兼容参数（当前仅 CPU）")
@@ -80,8 +81,30 @@ func Run(args []string) {
 	params.Dilate = *dilate
 	params.Margin = *margin
 	params.MaskPath = *mask
-	if *fast {
+	// --fast 为 --strategy crop 的兼容别名：两者同时显式给出视为参数冲突
+	strategySet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "strategy" {
+			strategySet = true
+		}
+	})
+	if *fast && strategySet {
+		fmt.Fprintln(os.Stderr, "--fast 与 --strategy 不可同时使用（--fast 等价于 --strategy crop）")
+		os.Exit(2)
+	}
+	switch {
+	case *fast:
 		params.Strategy = inpaint.StrategyCrop
+	case strategySet:
+		switch *strategy {
+		case inpaint.StrategyAuto, inpaint.StrategyOriginal, inpaint.StrategyCrop:
+			params.Strategy = *strategy
+		default:
+			fmt.Fprintf(os.Stderr, "无效 --strategy: %s（可选 auto|original|crop）\n", *strategy)
+			os.Exit(2)
+		}
+	default:
+		params.Strategy = inpaint.StrategyAuto
 	}
 	var err error
 	boxSpec := 0

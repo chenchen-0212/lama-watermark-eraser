@@ -220,6 +220,22 @@ function onKey(e) {
                   </label>
                 </div>
                 <div class="opt-row">
+                  <span class="opt-label">处理模式</span>
+                  <label class="radio">
+                    <input type="radio" value="auto" v-model="store.strategy" />
+                    智能
+                  </label>
+                  <label class="radio">
+                    <input type="radio" value="original" v-model="store.strategy" />
+                    整图
+                  </label>
+                  <label class="radio">
+                    <input type="radio" value="crop" v-model="store.strategy" />
+                    快速
+                  </label>
+                </div>
+                <p class="tip">智能=自动在整图修复与框周边裁剪间选择，兼顾速度与效果（默认）；整图=整图单次修复，最稳但大图慢；快速=只计算框选周边，大图最快。</p>
+                <div class="opt-row">
                   <span class="opt-label">边缘外扩</span>
                   <input type="number" min="0" max="80" v-model.number="store.dilate" class="input num" />
                   <span class="opt-unit">px</span>
@@ -227,14 +243,14 @@ function onKey(e) {
                 <div class="opt-row btns">
                   <button
                     class="btn btn-primary"
-                    :disabled="store.running || !store.boxes.length"
+                    :disabled="store.running || !store.boxes.length || !engineReady"
                     @click="startBatch(true)"
                   >
                     全部去水印
                   </button>
                   <button
                     class="btn"
-                    :disabled="store.running || store.selected.length === 0 || !store.boxes.length"
+                    :disabled="store.running || store.selected.length === 0 || !store.boxes.length || !engineReady"
                     @click="startBatch(false)"
                   >
                     仅勾选({{ store.selected.length }})
@@ -242,6 +258,10 @@ function onKey(e) {
                   <button class="btn btn-danger" :disabled="!store.running" @click="cancelBatch">取消</button>
                 </div>
                 <p class="tip">可拖拽框选多个水印区域；点区域右上角 ✕ 可删除单个，点「清空」全部删除。</p>
+                <p v-if="!engineReady" class="tip engine-status">
+                  {{ store.engineStatus === 'error' ? '⚠️' : '⏳' }}
+                  {{ store.engineMessage || 'AI 引擎启动中…' }}
+                </p>
               </div>
               <div class="log">
                 <div v-for="(l, i) in store.logs.slice(-80)" :key="i" :class="l.cls">{{ l.line }}</div>
