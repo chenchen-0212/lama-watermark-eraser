@@ -3,7 +3,7 @@
 ; 编译（在项目根目录执行）:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
 ; 产物:
-;   build\installer\社媒图文水印抹除工具_Setup_1.1.0.exe
+;   build\installer\社媒图文水印抹除工具_Setup_1.1.1.exe
 ;
 ; 说明:
 ;   - lamacore\ 为 PyInstaller onedir 引擎束（含 big-lama.pt，约 670MB），
@@ -15,7 +15,7 @@
 ;   - 本文件含中文，必须以 UTF-8（带 BOM）保存，否则 ISCC 按 ANSI 解析会乱码。
 
 #define MyAppName "社媒图文水印抹除工具"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "csy"
 #define MyAppExeName "社媒图文水印抹除工具.exe"
 

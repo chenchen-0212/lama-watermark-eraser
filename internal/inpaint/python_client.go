@@ -41,6 +41,7 @@ type PythonEngine struct {
 	stdout    *bufio.Reader
 	stderrRaw io.ReadCloser
 	stderr    *stderrRing
+	job       jobHandle // KILL_ON_JOB_CLOSE 作业句柄；0=未托管（非 Windows 恒为 0）
 	seq       int64
 	ready     bool
 	closed    bool
@@ -109,6 +110,12 @@ func (e *PythonEngine) startLocked(ctx context.Context) error {
 	e.stderrRaw = stderr
 	e.stderr.reset()
 	go e.drainStderr(stderr)
+
+	// Bug B 双保险之二：把子进程挂入 KILL_ON_JOB_CLOSE 作业。宿主进程无论
+	// 正常退出、崩溃还是被 taskkill /F，内核都会在关闭作业句柄时终止整棵
+	// 引擎进程树；失败（如 Win7 已在不允许 breakaway 的作业内）降级为记
+	// stderr 忽略，不影响引擎启动。
+	e.attachJobLocked(cmd.Process.Pid)
 
 	id := atomic.AddInt64(&e.seq, 1)
 	hello := NewRequest(MsgHello, id, map[string]any{
@@ -313,6 +320,34 @@ func (e *PythonEngine) readResponseLocked(ctx context.Context, timeout time.Dura
 	}
 }
 
+// attachJobLocked 创建 KILL_ON_JOB_CLOSE 作业并绑定子进程。任何失败都只记
+// stderr，不影响引擎启动 —— 正常退出路径仍有 wails OnShutdown 钩子与
+// terminateLocked 兜底。需持有 e.mu；应在 cmd.Start 成功后立即调用，使引擎
+// 后续派生的子进程均继承作业成员资格。
+func (e *PythonEngine) attachJobLocked(pid int) {
+	e.closeJobLocked() // 回收上一轮句柄（旧进程此刻已回收，作业应为空）
+	h, err := createKillOnCloseJob()
+	if err != nil {
+		e.stderr.add("job object 创建失败，跳过进程树托管: " + err.Error())
+		return
+	}
+	if err := assignProcessToJob(h, pid); err != nil {
+		e.stderr.add(fmt.Sprintf("job object 绑定失败(pid=%d)，跳过进程树托管: %v", pid, err))
+		closeJob(h) // 绑定失败时作业为空，直接关闭避免句柄泄漏
+		return
+	}
+	e.job = h
+}
+
+// closeJobLocked 关闭当前作业句柄；KILL_ON_JOB_CLOSE 语义下若作业内仍有
+// 残留进程会被内核终止。仅在持有 e.mu 且引擎进程已回收时调用。需持有 e.mu。
+func (e *PythonEngine) closeJobLocked() {
+	if e.job != 0 {
+		closeJob(e.job)
+		e.job = 0
+	}
+}
+
 // terminateLocked 终止并回收当前子进程。grace 为优雅等待时长（0 表示立即强杀）。
 // 必须在持有 e.mu 时调用；保证 cmd.Wait 只被调用一次。
 func (e *PythonEngine) terminateLocked(grace time.Duration) {
@@ -360,6 +395,9 @@ func (e *PythonEngine) resetPipesLocked() {
 	}
 	e.stdout = nil
 	e.ready = false
+	// 引擎进程此刻已被回收，关闭作业句柄不会误杀新进程；
+	// 若仍有残留（如宽限期未完成回收），KILL_ON_JOB_CLOSE 会兜底终止。
+	e.closeJobLocked()
 }
 
 // drainStderr 持续排空 stderr，防子进程写满管道阻塞。

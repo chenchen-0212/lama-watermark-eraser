@@ -81,6 +81,31 @@ func (a *App) startup(ctx context.Context) {
 	}()
 }
 
+// shutdown Wails 生命周期：应用退出时优雅关闭引擎子进程（Bug B 修复之一）。
+// 与 KILL_ON_JOB_CLOSE 作业对象互为双保险：正常关窗走此处（发送 shutdown
+// 消息、等待退出并回收进程）；崩溃 / taskkill /F 等异常退出由作业对象在
+// 内核层兜底杀树。
+func (a *App) shutdown(_ context.Context) {
+	a.engineMu.Lock()
+	e := a.engine
+	a.engineMu.Unlock()
+	if e == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = e.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		// Close 长时间未返回（如预热进行中持有引擎锁）：不阻塞退出路径，
+		// 进程退出后作业对象会终止引擎进程树。
+		go func() { _ = e.Kill() }()
+	}
+}
+
 // ensureEngine 返回可用引擎。状态机：
 //   - ready：直接返回；
 //   - starting：阻塞等待本次启动尝试结束（尊重 ctx 取消）；

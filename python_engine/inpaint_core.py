@@ -18,6 +18,8 @@ big-lama 推理核心（逐项对齐 IOPaint）。
      其保存路径用 cv2.imencode（BGR 原生）最终落盘为 RGB；故本模块直接返回
      RGB888（= 模型 RGB 输出），与 IOPaint 落盘结果逐像素一致。
 """
+import os
+
 import numpy as np
 import torch
 
@@ -60,9 +62,37 @@ def pad_img_to_modulo(img, mod):
     )
 
 
+def _is_pure_ascii(path):
+    """路径字符串是否纯 ASCII。
+
+    Windows 下 LibTorch C++ 层的 fopen 仅按 ANSI 代码页解释收到的字节串，
+    非 ASCII（中文安装目录）路径会 errno 2 失败；纯 ASCII 路径无此问题。
+    """
+    return path.isascii()
+
+
 def load_model(model_path, device="cpu"):
-    """对齐 iopaint.helper.load_jit_model 的 CPU 分支：torch.jit.load + eval。"""
-    model = torch.jit.load(model_path, map_location="cpu")
+    """对齐 iopaint.helper.load_jit_model 的 CPU 分支：torch.jit.load + eval。
+
+    Bug A 修复（v1.1.1）：torch.jit.load 把 Python str 路径按 UTF-8 传给
+    LibTorch C++ 层，后者用 ANSI 代码页（GBK）fopen —— 安装到中文目录时
+    （如 D:\\...\\社媒图文水印抹除工具\\）即使文件存在也报 errno 2。
+    规避方案：路径含非 ASCII 字符时先 chdir 到模型所在目录，再以纯 ASCII
+    裸文件名（交付契约恒为 big-lama.pt）加载，finally 恢复原工作目录。
+    worker 协议为半双工串行（同一时刻至多一个请求在途），chdir 无并发竞态。
+    """
+    path = os.fspath(model_path)
+    if _is_pure_ascii(path):
+        model = torch.jit.load(path, map_location="cpu")
+    else:
+        model_dir = os.path.dirname(os.path.abspath(path)) or "."
+        bare_name = os.path.basename(path)
+        prev_cwd = os.getcwd()
+        os.chdir(model_dir)
+        try:
+            model = torch.jit.load(bare_name, map_location="cpu")
+        finally:
+            os.chdir(prev_cwd)
     if device and device != "cpu":
         model = model.to(device)
     model.eval()
