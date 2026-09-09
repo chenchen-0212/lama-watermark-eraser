@@ -24,7 +24,9 @@ AppId={{8F7A2C90-5B1E-4C6D-9E3F-A1B2C3D4E5F6}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\{#MyAppName}
+; 默认安装目录用英文（与 %LOCALAPPDATA% 下应用数据目录同名）；
+; 已装旧中文目录的升级仍沿用旧目录（UsePreviousAppDir），卸载重装才落新默认目录。
+DefaultDirName={autopf}\LaMaWatermarkRemover
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\build\installer
