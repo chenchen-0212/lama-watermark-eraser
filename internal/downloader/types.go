@@ -13,6 +13,10 @@ type Post struct {
 	Dir      string   `json:"dir"`   // 图片本地目录
 	Files    []string `json:"files"` // 已下载图片路径（按序）
 	Count    int      `json:"count"`
+	// AudioURL 帖子 BGM 音频源地址（无则空；不自动下载，由前端用户确认后经 DownloadBGM 保存）
+	AudioURL string `json:"audioUrl"`
+	// AudioName 平台提供的曲目名（用作展示/命名参考，可为空）
+	AudioName string `json:"audioName"`
 }
 
 var (

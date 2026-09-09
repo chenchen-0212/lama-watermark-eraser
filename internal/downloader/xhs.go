@@ -114,7 +114,24 @@ func DownloadXHS(ctx context.Context, url, outDir string) (*Post, error) {
 	if post.Count == 0 {
 		return nil, fmt.Errorf("图片下载全部失败（可能触发风控，请稍后重试或配置 Cookie）")
 	}
+	post.AudioURL, post.AudioName = xhsMusic(note)
 	return post, nil
+}
+
+// xhsMusic 提取笔记 BGM（音频 URL 与曲目名）。部分笔记无 BGM，返回空串。
+// URL 字段在不同版本页面中可能是 url / musicUrl / attachUrl，逐一尝试。
+func xhsMusic(note gjson.Result) (audioURL, audioName string) {
+	for _, f := range []string{"url", "musicUrl", "attachUrl"} {
+		if u := strings.TrimSpace(note.Get("music." + f).String()); u != "" {
+			audioURL = u
+			break
+		}
+	}
+	audioName = strings.TrimSpace(note.Get("music.name").String())
+	if audioName == "" {
+		audioName = strings.TrimSpace(note.Get("music.singer").String())
+	}
+	return audioURL, audioName
 }
 
 func imgExtFromURL(u string) string {

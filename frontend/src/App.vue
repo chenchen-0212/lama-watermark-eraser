@@ -9,6 +9,7 @@ import {
   cancelBatch,
   exportZip,
   exportSourceZip,
+  saveBGM,
   showToast,
   viewImage,
   closeViewer,
@@ -87,6 +88,29 @@ async function clearCookie() {
   }
 }
 
+// BGM 保存弹窗：默认名 bgm.mp3，确认后经后端下载到帖子图片目录
+const hasBGM = computed(() => !!(store.post && store.post.audioUrl))
+const showBGM = ref(false)
+const bgmName = ref('bgm.mp3')
+const bgmSaving = ref(false)
+
+function openBGM() {
+  bgmName.value = store.post?.audioName
+    ? store.post.audioName.replace(/[\\/:*?"<>|]/g, ' ').trim() || 'bgm.mp3'
+    : 'bgm.mp3'
+  showBGM.value = true
+}
+
+async function confirmBGM() {
+  bgmSaving.value = true
+  try {
+    await saveBGM(bgmName.value.trim())
+    showBGM.value = false
+  } finally {
+    bgmSaving.value = false
+  }
+}
+
 function go() {
   if (store.running) return
   startDownload()
@@ -112,6 +136,7 @@ function onKey(e) {
     if (store.viewer.open) closeViewer()
     else if (showNotice.value) showNotice.value = false
     else if (showCookie.value) showCookie.value = false
+    else if (showBGM.value) showBGM.value = false
   }
 }
 </script>
@@ -260,6 +285,16 @@ function onKey(e) {
                   <button class="btn" :disabled="store.running" @click="exportSourceZip" title="把未去水印的原图打包为 zip 导出">
                     ⬇ 源图打包
                   </button>
+                  <button
+                    v-if="hasBGM"
+                    class="btn"
+                    :class="{ 'bgm-done': !!store.bgmSaved }"
+                    :disabled="store.running"
+                    @click="openBGM"
+                    :title="store.post.audioName ? `曲目：${store.post.audioName}` : '下载该图文的背景音乐'"
+                  >
+                    {{ store.bgmSaved ? '🎵 BGM 已下载' : '🎵 下载BGM' }}
+                  </button>
                 </div>
                 <p class="tip">可拖拽框选多个水印区域；点区域右上角 ✕ 可删除单个，点「清空」全部删除。</p>
                 <p v-if="!engineReady" class="tip engine-status">
@@ -402,6 +437,36 @@ function onKey(e) {
             <button class="btn" :disabled="cookieSaving" @click="showCookie = false">取消</button>
             <button class="btn btn-primary" :disabled="cookieSaving" @click="saveCookie">
               {{ cookieSaving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- BGM 保存弹窗 -->
+    <transition name="fade">
+      <div v-if="showBGM" class="notice-mask" @click.self="showBGM = false">
+        <div class="card notice-panel bgm-panel">
+          <div class="notice-head">
+            <span class="notice-title">🎵 保存背景音乐</span>
+            <button class="viewer-close" @click="showBGM = false">✕</button>
+          </div>
+          <div class="notice-body">
+            <p v-if="store.post?.audioName" class="bgm-track">曲目：{{ store.post.audioName }}</p>
+            <p>保存文件名（不输入即默认 <b>bgm.mp3</b>）：</p>
+            <input
+              v-model="bgmName"
+              class="input bgm-input"
+              placeholder="bgm.mp3"
+              spellcheck="false"
+              @keyup.enter="confirmBGM"
+            />
+            <p v-if="store.bgmSaved" class="bgm-saved-tip">已保存：{{ store.bgmSaved }}（重复确定将覆盖）</p>
+          </div>
+          <div class="notice-foot">
+            <button class="btn" :disabled="bgmSaving" @click="showBGM = false">取消</button>
+            <button class="btn btn-primary" :disabled="bgmSaving" @click="confirmBGM">
+              {{ bgmSaving ? '下载中…' : '确定' }}
             </button>
           </div>
         </div>
@@ -592,6 +657,14 @@ function onKey(e) {
 .cookie-foot { justify-content: flex-start; gap: 8px; }
 .cookie-foot .cookie-clear { color: var(--danger); }
 .cookie-foot .cookie-spacer { flex: 1; }
+
+/* BGM 保存弹窗 */
+.bgm-panel { width: min(440px, 94vw); }
+.bgm-panel .notice-body p { margin: 8px 0 0; color: var(--text-2); font-size: 12.5px; }
+.bgm-track { color: var(--text) !important; font-weight: 600; }
+.bgm-input { margin-top: 8px; }
+.bgm-saved-tip { color: var(--text-3) !important; font-size: 11.5px !important; word-break: break-all; }
+.bgm-done { color: var(--ok, #30d158); }
 .platforms { margin-top: 18px; display: flex; gap: 8px; justify-content: center; }
 .chip {
   font-size: 12px; color: var(--text-2);

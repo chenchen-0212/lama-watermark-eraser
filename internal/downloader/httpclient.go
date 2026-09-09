@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -49,7 +50,8 @@ func platformFromURL(rawURL string) string {
 		strings.Contains(host, "zjcdn"),   // 抖音图片 CDN
 		strings.Contains(host, "byteimg"), // 抖音图片 CDN
 		strings.Contains(host, "douyinpic"),
-		strings.Contains(host, "douyinvod"):
+		strings.Contains(host, "douyinvod"),
+		strings.Contains(host, "pstatp"): // 抖音音乐/媒体 CDN（字节跳动）
 		return "douyin"
 	case strings.Contains(host, "xiaohongshu"),
 		strings.Contains(host, "xhscdn"):
@@ -131,6 +133,89 @@ func sniffExt(contentType string) string {
 	default:
 		return ""
 	}
+}
+
+// audioExts 可接受的音频文件扩展名（小写，含点）。
+var audioExts = map[string]bool{
+	".mp3": true, ".m4a": true, ".aac": true, ".wav": true, ".flac": true, ".ogg": true,
+}
+
+// ensureAudioExt 文件名无音频扩展名时补 .mp3（用户明确要求 mp3 交付形态）。
+// 已带合法音频扩展名（如 .m4a）时保持不变。
+func ensureAudioExt(name string) string {
+	if audioExts[strings.ToLower(filepath.Ext(name))] {
+		return name
+	}
+	return name + ".mp3"
+}
+
+// audioRequestMeta 按音频 CDN 主机选择 Referer 与 UA（复用浏览器指纹降低风控概率）。
+func audioRequestMeta(u string) (referer, ua string) {
+	ua = BrowserUA
+	switch {
+	case strings.Contains(u, "xiaohongshu"), strings.Contains(u, "xhscdn"):
+		return "https://www.xiaohongshu.com/", ua
+	case strings.Contains(u, "douyin"), strings.Contains(u, "douyinvod"),
+		strings.Contains(u, "dycdn"), strings.Contains(u, "pstatp"),
+		strings.Contains(u, "zjcdn"), strings.Contains(u, "byteimg"):
+		return "https://www.douyin.com/", ua
+	default:
+		return "", ua
+	}
+}
+
+// SaveAudio 下载音频文件到 dstDir（自定义文件名，缺省/非法时兜底 bgm.mp3）。
+// 与图片下载不同：不按序号命名、扩展名显式控制，避免音频被误存为 .jpg。
+func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, error) {
+	audioURL = strings.TrimSpace(audioURL)
+	if audioURL == "" {
+		return "", fmt.Errorf("音频地址为空（该帖子可能没有 BGM）")
+	}
+	if !strings.HasPrefix(audioURL, "http://") && !strings.HasPrefix(audioURL, "https://") {
+		return "", fmt.Errorf("音频地址无效: %s", audioURL)
+	}
+	if dstDir == "" {
+		return "", fmt.Errorf("保存目录为空")
+	}
+	name := sanitizeFilename(filename)
+	if name == "" {
+		name = "bgm"
+	}
+	name = ensureAudioExt(name)
+
+	referer, ua := audioRequestMeta(audioURL)
+	req, err := newRequest(ctx, audioURL, referer, ua)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d 音频下载失败: %s", resp.StatusCode, audioURL)
+	}
+	dst := filepath.Join(dstDir, name)
+	tmp := dst + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return dst, nil
 }
 
 // downloadFile 下载图片到 dstDir，按序号命名；ext 为空时按 Content-Type 推断。

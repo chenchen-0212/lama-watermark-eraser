@@ -128,7 +128,22 @@ func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 	if post.Count == 0 {
 		return nil, fmt.Errorf("图片下载全部失败（可能触发风控，请稍后重试）")
 	}
+	post.AudioURL, post.AudioName = douyinMusic(item)
 	return post, nil
+}
+
+// douyinMusic 提取作品 BGM（音频 URL 与曲目名）。图文作品通常带背景音乐；
+// 原声/无音乐时 music 节点可能为空或无播放地址，返回空串。
+func douyinMusic(item gjson.Result) (audioURL, audioName string) {
+	audioURL = firstURL(item.Get("music.play_url.url_list"))
+	if audioURL == "" {
+		audioURL = strings.TrimSpace(item.Get("music.play_url.uri").String())
+	}
+	audioName = strings.TrimSpace(item.Get("music.title").String())
+	if audioName == "" {
+		audioName = strings.TrimSpace(item.Get("music.author").String())
+	}
+	return audioURL, audioName
 }
 
 // findDouyinItem 在 _ROUTER_DATA 的 loaderData 中定位 item_list 第一项。

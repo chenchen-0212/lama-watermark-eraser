@@ -253,6 +253,17 @@ func (a *App) DownloadSocial(url string) (*downloader.Post, error) {
 	return post, nil
 }
 
+// DownloadBGM 下载帖子 BGM 音频到指定目录（用户在弹窗中自定义文件名）。
+// filename 为空或仅含非法字符时兜底 bgm.mp3；返回保存的完整路径。
+// BGM 属可选项，失败由前端提示，不影响图片流水线。
+func (a *App) DownloadBGM(audioURL, dir, filename string) (string, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return downloader.SaveAudio(ctx, audioURL, dir, filename)
+}
+
 // ---------------------------------------------------------- 步骤4 去水印
 
 // StartBatch 批量去水印（异步执行，进度经 batch:progress 事件推送）。

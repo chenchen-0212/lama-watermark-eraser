@@ -2,6 +2,7 @@ import { reactive } from 'vue'
 import {
   GetThumb,
   DownloadSocial,
+  DownloadBGM,
   StartBatch,
   CancelBatch,
   ZipDirectory,
@@ -19,7 +20,8 @@ export const store = reactive({
   // 流水线状态机：idle → downloading → downloaded → inpainting → inpainted
   stage: 'idle',
   inputUrl: '',
-  post: null, // {platform,title,author,dir,files,count}
+  post: null, // {platform,title,author,dir,files,count,audioUrl,audioName}
+  bgmSaved: '', // 已保存的 BGM 本地路径（空=未下载）
   sourceThumbs: [], // [{path,thumb,name}]
   cleanedThumbs: [],
   cleanedDir: '',
@@ -70,6 +72,7 @@ export async function startDownload() {
   try {
     const post = await DownloadSocial(url)
     store.post = post
+    store.bgmSaved = ''
     store.selected = []
     store.previewPath = ''
     store.sourceThumbs = []
@@ -121,7 +124,10 @@ export async function loadLocalFolder() {
       dir: dir,
       files: files,
       count: files.length,
+      audioUrl: '',
+      audioName: '',
     }
+    store.bgmSaved = ''
     store.selected = []
     store.previewPath = ''
     store.sourceThumbs = []
@@ -228,6 +234,25 @@ export async function exportSourceZip() {
   } catch (e) {
     log('源图打包失败: ' + e, 'fail')
     showToast(String(e))
+  }
+}
+
+// 下载 BGM：filename 由用户在弹窗中输入（空则后端兜底 bgm.mp3），保存到帖子图片目录
+// （源图打包 zip 会自动包含）。成功后记录 store.bgmSaved 供按钮回显。
+export async function saveBGM(filename) {
+  const post = store.post
+  if (!post || !post.audioUrl) {
+    showToast('当前帖子没有可下载的 BGM', 'danger')
+    return
+  }
+  try {
+    const saved = await DownloadBGM(post.audioUrl, post.dir, filename || '')
+    store.bgmSaved = saved
+    log(`BGM 已保存: ${fileName(saved)}（含在源图打包中）`, 'ok')
+    showToast('BGM 已保存', 'ok')
+  } catch (e) {
+    log('BGM 下载失败: ' + e, 'fail')
+    showToast('BGM 下载失败: ' + e)
   }
 }
 
