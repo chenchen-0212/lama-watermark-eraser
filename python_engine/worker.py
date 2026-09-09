@@ -128,6 +128,10 @@ class Worker:
         h = int(data.get("height", 0))
         if w <= 0 or h <= 0:
             raise ValueError("无效图像尺寸: %dx%d" % (w, h))
+        # big-lama 对极小图（≤8px）无法正常处理（IOPaint 同样失败）；
+        # 进入模型前先给出可读错误，避免 TorchScript 深层多行报错刷屏。
+        if w <= 8 or h <= 8:
+            raise ValueError("图片尺寸过小（≤8px），模型无法处理")
 
         img_bytes = base64.b64decode(data.get("image_b64", ""))
         mask_bytes = base64.b64decode(data.get("mask_b64", ""))
@@ -175,6 +179,8 @@ class Worker:
                         "data": {"status": "bye"}}
             return _err(mtype, rid, "INVALID_REQUEST", "未知消息类型: %s" % mtype)
         except Exception as exc:  # 单张异常不退出进程
+            # 完整异常与调用栈写入 stderr（Go 侧 LastStderr 留档）；
+            # 协议消息只保留首行可读摘要，避免 TorchScript 多行栈污染 CLI/GUI。
             _log("handle %s failed: %s\n%s" % (mtype, exc, traceback.format_exc()))
             if mtype == "infer":
                 code = "INVALID_IMAGE" if isinstance(exc, ValueError) else "INFER_FAILED"
@@ -182,7 +188,11 @@ class Worker:
                 code = "MODEL_LOAD_FAILED"
             else:
                 code = "INVALID_REQUEST"
-            return _err(mtype, rid, code, str(exc))
+            lines = [ln for ln in str(exc).strip().splitlines() if ln.strip()]
+            brief = lines[0] if lines else "未知错误"
+            if len(brief) > 200:
+                brief = brief[:200] + "…"
+            return _err(mtype, rid, code, brief)
 
     def run(self):
         for line in sys.stdin:

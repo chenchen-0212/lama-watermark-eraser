@@ -77,6 +77,8 @@ func (e *PythonEngine) startLocked(ctx context.Context) error {
 
 	cmd := exec.Command(e.exe, e.Args...)
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
+	// GUI 场景下隐藏引擎控制台窗口（CREATE_NO_WINDOW）；stdio 管道不受影响
+	cmd.SysProcAttr = hideEngineWindowSysProcAttr()
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

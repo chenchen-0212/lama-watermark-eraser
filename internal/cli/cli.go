@@ -35,6 +35,12 @@ func Run(args []string) {
 	_ = fs.String("model", "", "兼容参数（模型路径由伴生引擎决定）")
 	_ = fs.Parse(args)
 
+	// --mask 与框选参数描述同一水印区域，同时给出时语义冲突，直接报错退出
+	if merr := checkRegionMutex(*mask, *box, *relBox, *boxes, *relBoxes); merr != nil {
+		fmt.Fprintln(os.Stderr, merr)
+		os.Exit(2)
+	}
+
 	ctx := context.Background()
 
 	var inputDir string
@@ -176,6 +182,30 @@ func Run(args []string) {
 	if ok != len(results) {
 		os.Exit(2)
 	}
+}
+
+// checkRegionMutex 校验 --mask 与框选参数不可同时使用。
+// 掩膜与坐标框描述的是同一个水印区域，同时给出时无法判定以谁为准，
+// 返回错误并指明检测到的冲突参数，提示调用方只保留一种区域描述方式。
+func checkRegionMutex(mask, box, relBox, boxes, relBoxes string) error {
+	if mask == "" {
+		return nil
+	}
+	pairs := []struct {
+		name  string
+		value string
+	}{
+		{"--box", box},
+		{"--relative-box", relBox},
+		{"--boxes", boxes},
+		{"--relative-boxes", relBoxes},
+	}
+	for _, p := range pairs {
+		if p.value != "" {
+			return fmt.Errorf("--mask 与 --box/--boxes 不可同时使用（同时检测到 %s）", p.name)
+		}
+	}
+	return nil
 }
 
 func parseBox(s string, relative bool) ([4]float64, error) {
