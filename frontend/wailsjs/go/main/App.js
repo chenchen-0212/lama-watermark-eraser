@@ -18,6 +18,10 @@ export function DownloadSocial(arg1) {
   return window['go']['main']['App']['DownloadSocial'](arg1);
 }
 
+export function ExportSourceZip(arg1) {
+  return window['go']['main']['App']['ExportSourceZip'](arg1);
+}
+
 export function GetDouyinCookie() {
   return window['go']['main']['App']['GetDouyinCookie']();
 }

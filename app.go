@@ -371,6 +371,23 @@ func (a *App) ZipDirectory(dir string) (string, error) {
 	return dst, nil
 }
 
+// ExportSourceZip 打包源图目录（未去水印原图）为 zip，返回生成路径。
+// 交付链路与结果页 ZipDirectory 完全一致：生成 zip → 前端 PickSaveFile → CopyFile；
+// 命名沿用同一时间戳规则（源图_<时间戳>.zip），避免重复导出重名冲突。
+func (a *App) ExportSourceZip(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("源图目录为空")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("源图目录不存在: %s", dir)
+	}
+	dst := filepath.Join(workspaceDir(), fmt.Sprintf("源图_%s.zip", time.Now().Format("20060102_150405")))
+	if err := ziputil.ZipDir(dir, dst); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
 // PickDirectory 目录选择对话框。
 func (a *App) PickDirectory() (string, error) {
 	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{Title: "选择文件夹"})

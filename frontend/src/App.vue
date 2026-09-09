@@ -8,6 +8,7 @@ import {
   startBatch,
   cancelBatch,
   exportZip,
+  exportSourceZip,
   showToast,
   viewImage,
   closeViewer,
@@ -256,6 +257,9 @@ function onKey(e) {
                     仅勾选({{ store.selected.length }})
                   </button>
                   <button class="btn btn-danger" :disabled="!store.running" @click="cancelBatch">取消</button>
+                  <button class="btn" :disabled="store.running" @click="exportSourceZip" title="把未去水印的原图打包为 zip 导出">
+                    ⬇ 源图打包
+                  </button>
                 </div>
                 <p class="tip">可拖拽框选多个水印区域；点区域右上角 ✕ 可删除单个，点「清空」全部删除。</p>
                 <p v-if="!engineReady" class="tip engine-status">

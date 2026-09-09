@@ -11,6 +11,7 @@ import {
   PickDirectory,
   ListImages,
   GetEngineStatus,
+  ExportSourceZip,
 } from '../wailsjs/go/main/App'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 
@@ -206,6 +207,26 @@ export async function exportZip() {
     }
   } catch (e) {
     log('导出失败: ' + e, 'fail')
+    showToast(String(e))
+  }
+}
+
+// 源图打包：把当前源图目录（未去水印原图）打包 zip，交付链路与结果页导出一致
+export async function exportSourceZip() {
+  if (!store.post || !store.post.dir) {
+    showToast('没有可打包的源图目录', 'danger')
+    return
+  }
+  try {
+    const zipPath = await ExportSourceZip(store.post.dir)
+    const saveTo = await PickSaveFile(fileName(zipPath))
+    if (saveTo) {
+      await CopyFile(zipPath, saveTo)
+      log('已保存源图: ' + saveTo, 'ok')
+      showToast('源图 zip 已保存', 'ok')
+    }
+  } catch (e) {
+    log('源图打包失败: ' + e, 'fail')
     showToast(String(e))
   }
 }

@@ -11,6 +11,8 @@ export function DetectURL(arg1:string):Promise<string>;
 
 export function DownloadSocial(arg1:string):Promise<downloader.Post>;
 
+export function ExportSourceZip(arg1:string):Promise<string>;
+
 export function GetDouyinCookie():Promise<string>;
 
 export function GetEngineStatus():Promise<Record<string, string>>;
