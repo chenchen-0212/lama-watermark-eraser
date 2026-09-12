@@ -140,11 +140,41 @@ var audioExts = map[string]bool{
 	".mp3": true, ".m4a": true, ".aac": true, ".wav": true, ".flac": true, ".ogg": true,
 }
 
-// ensureAudioExt 文件名无音频扩展名时补 .mp3（用户明确要求 mp3 交付形态）。
-// 已带合法音频扩展名（如 .m4a）时保持不变。
-func ensureAudioExt(name string) string {
+// sniffAudioExt 按音频 Content-Type 推断扩展名（抖音实测返回 audio/mp4 即 m4a）。
+func sniffAudioExt(contentType string) string {
+	ct := contentType
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	switch ct {
+	case "audio/mp4", "audio/x-m4a", "audio/m4a":
+		return ".m4a"
+	case "audio/mpeg", "audio/mp3":
+		return ".mp3"
+	case "audio/aac":
+		return ".aac"
+	case "audio/wav", "audio/x-wav":
+		return ".wav"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/flac":
+		return ".flac"
+	default:
+		return ""
+	}
+}
+
+// resolveAudioName 决定音频最终文件名：用户显式音频扩展 > URL 路径扩展 >
+// Content-Type 推断 > 兜底 .mp3。用户名总是保留（扩展缺失时补）。
+func resolveAudioName(name, audioURL, contentType string) string {
 	if audioExts[strings.ToLower(filepath.Ext(name))] {
 		return name
+	}
+	if e := strings.ToLower(filepath.Ext(trimQuery(audioURL))); audioExts[e] {
+		return name + e
+	}
+	if e := sniffAudioExt(contentType); e != "" {
+		return name + e
 	}
 	return name + ".mp3"
 }
@@ -164,8 +194,9 @@ func audioRequestMeta(u string) (referer, ua string) {
 	}
 }
 
-// SaveAudio 下载音频文件到 dstDir（自定义文件名，缺省/非法时兜底 bgm.mp3）。
-// 与图片下载不同：不按序号命名、扩展名显式控制，避免音频被误存为 .jpg。
+// SaveAudio 下载音频文件到 dstDir（自定义文件名，缺省/非法时兜底 bgm）。
+// 扩展名按「用户显式指定 > URL 路径 > Content-Type > .mp3」解析，避免把
+// m4a 音频误存为 .mp3。
 func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, error) {
 	audioURL = strings.TrimSpace(audioURL)
 	if audioURL == "" {
@@ -181,7 +212,6 @@ func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, 
 	if name == "" {
 		name = "bgm"
 	}
-	name = ensureAudioExt(name)
 
 	referer, ua := audioRequestMeta(audioURL)
 	req, err := newRequest(ctx, audioURL, referer, ua)
@@ -196,7 +226,7 @@ func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d 音频下载失败: %s", resp.StatusCode, audioURL)
 	}
-	dst := filepath.Join(dstDir, name)
+	dst := filepath.Join(dstDir, resolveAudioName(name, audioURL, resp.Header.Get("Content-Type")))
 	tmp := dst + ".part"
 	f, err := os.Create(tmp)
 	if err != nil {

@@ -8,6 +8,8 @@ export namespace downloader {
 	    dir: string;
 	    files: string[];
 	    count: number;
+	    audioUrl: string;
+	    audioName: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Post(source);
@@ -22,6 +24,8 @@ export namespace downloader {
 	        this.dir = source["dir"];
 	        this.files = source["files"];
 	        this.count = source["count"];
+	        this.audioUrl = source["audioUrl"];
+	        this.audioName = source["audioName"];
 	    }
 	}
 

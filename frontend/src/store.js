@@ -41,6 +41,8 @@ export const store = reactive({
   toast: '', // 非空则显示
   toastKind: 'info',
   viewer: { open: false, name: '', src: '', loading: false },
+  viewerList: [], // 放大浮层当前的图片列表（用于左右切换）
+  viewerIndex: -1, // 当前查看的图片在列表中的下标（-1=不在列表中）
 })
 
 let toastTimer = null
@@ -268,8 +270,15 @@ export async function loadCleanedThumbs(dir, files) {
   }
 }
 
-// 放大查看：加载原图（maxW=0 不缩放）到全屏浮层
-export async function viewImage(path) {
+// 放大查看：加载原图（maxW=0 不缩放）到全屏浮层；记录所在列表用于左右切换
+export async function viewImage(path, list) {
+  const items = Array.isArray(list) && list.length ? list : store.cleanedThumbs
+  store.viewerList = items
+  store.viewerIndex = items.findIndex((t) => t.path === path)
+  await loadViewer(path)
+}
+
+async function loadViewer(path) {
   store.viewer = { open: true, name: fileName(path), src: '', loading: true }
   try {
     const t = await GetThumb(path, 0)
@@ -280,6 +289,14 @@ export async function viewImage(path) {
   } finally {
     store.viewer.loading = false
   }
+}
+
+// 放大浮层内左右切换：dir=-1 上一张 / +1 下一张（首尾循环）
+export function viewerNav(dir) {
+  const items = store.viewerList
+  if (!items.length || store.viewerIndex < 0) return
+  store.viewerIndex = (store.viewerIndex + dir + items.length) % items.length
+  loadViewer(items[store.viewerIndex].path)
 }
 
 export function closeViewer() {

@@ -14,12 +14,12 @@ export function DetectURL(arg1) {
   return window['go']['main']['App']['DetectURL'](arg1);
 }
 
-export function DownloadSocial(arg1) {
-  return window['go']['main']['App']['DownloadSocial'](arg1);
-}
-
 export function DownloadBGM(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadBGM'](arg1, arg2, arg3);
+}
+
+export function DownloadSocial(arg1) {
+  return window['go']['main']['App']['DownloadSocial'](arg1);
 }
 
 export function ExportSourceZip(arg1) {

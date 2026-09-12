@@ -129,7 +129,39 @@ func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 		return nil, fmt.Errorf("图片下载全部失败（可能触发风控，请稍后重试）")
 	}
 	post.AudioURL, post.AudioName = douyinMusic(item)
+	if post.AudioURL == "" {
+		// SSR 页面（桌面页与分享页）已不再内嵌音频地址，回退无签名 detail API
+		//（需配置 Cookie 才稳定可用；拿不到时保持空，前端不显示 BGM 按钮）
+		if u, n := douyinDetailMusicURL(ctx, id); u != "" {
+			post.AudioURL = u
+			if post.AudioName == "" {
+				post.AudioName = n
+			}
+		}
+	}
 	return post, nil
+}
+
+// douyinDetailMusicURL 通过无签名 detail API 获取 BGM 播放地址与曲目名。
+// 返回纯音频（实测为 m4a 容器）；未配置 Cookie 或风控时拿不到，返回空串。
+func douyinDetailMusicURL(ctx context.Context, id string) (audioURL, audioName string) {
+	api := "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=" + id +
+		"&aid=6383&cookie_enabled=true&platform=PC&downlink=1"
+	data, _, err := httpGet(ctx, api, "https://www.douyin.com/", BrowserUA)
+	if err != nil {
+		return "", ""
+	}
+	aweme := gjson.Parse(string(data)).Get("aweme_detail")
+	if !aweme.Exists() {
+		return "", ""
+	}
+	m := aweme.Get("music")
+	audioURL = firstURL(m.Get("play_url.url_list"))
+	if audioURL == "" {
+		audioURL = strings.TrimSpace(m.Get("play_url.uri").String())
+	}
+	audioName = strings.TrimSpace(m.Get("title").String())
+	return audioURL, audioName
 }
 
 // douyinMusic 提取作品 BGM（音频 URL 与曲目名）。图文作品通常带背景音乐；

@@ -32,18 +32,23 @@ func TestSanitizeFilename(t *testing.T) {
 }
 
 func TestEnsureAudioExt(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"bgm", "bgm.mp3"},
-		{"", ".mp3"},
-		{"song.mp3", "song.mp3"},
-		{"song.MP3", "song.MP3"},
-		{"song.m4a", "song.m4a"},
-		{"song.M4A", "song.M4A"},
-		{"song.txt", "song.txt.mp3"}, // 非音频扩展 → 追加
+	cases := []struct {
+		name, url, ct, want string
+	}{
+		{"bgm", "https://x/a", "audio/mp4", "bgm.m4a"},      // 抖音实测：audio/mp4 = m4a
+		{"bgm", "https://x/a", "audio/mpeg", "bgm.mp3"},
+		{"bgm", "https://x/a", "", "bgm.mp3"},               // 兜底
+		{"bgm", "https://x/a.mp3", "", "bgm.mp3"},           // URL 路径扩展
+		{"bgm", "https://x/a.m4a", "audio/mpeg", "bgm.m4a"}, // URL 扩展优先于 CT
+		{"song.mp3", "https://x/a", "audio/mp4", "song.mp3"}, // 用户显式扩展优先
+		{"song.MP3", "https://x/a", "", "song.MP3"},
+		{"song.m4a", "https://x/a", "", "song.m4a"},
+		{"song.txt", "https://x/a", "audio/mpeg", "song.txt.mp3"}, // 非音频扩展 → 补
+		{"song", "https://x/a", "video/mp4", "song.mp3"},          // 非音频 CT → 兜底
 	}
 	for _, c := range cases {
-		if got := ensureAudioExt(c.in); got != c.want {
-			t.Errorf("ensureAudioExt(%q) = %q, want %q", c.in, got, c.want)
+		if got := resolveAudioName(c.name, c.url, c.ct); got != c.want {
+			t.Errorf("resolveAudioName(%q,%q,%q) = %q, want %q", c.name, c.url, c.ct, got, c.want)
 		}
 	}
 }

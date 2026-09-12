@@ -9,9 +9,9 @@ export function CopyFile(arg1:string,arg2:string):Promise<void>;
 
 export function DetectURL(arg1:string):Promise<string>;
 
-export function DownloadSocial(arg1:string):Promise<downloader.Post>;
-
 export function DownloadBGM(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function DownloadSocial(arg1:string):Promise<downloader.Post>;
 
 export function ExportSourceZip(arg1:string):Promise<string>;
 

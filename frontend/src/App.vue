@@ -12,6 +12,7 @@ import {
   saveBGM,
   showToast,
   viewImage,
+  viewerNav,
   closeViewer,
 } from './store.js'
 import { GetDouyinCookie, SetDouyinCookie } from '../wailsjs/go/main/App'
@@ -96,8 +97,8 @@ const bgmSaving = ref(false)
 
 function openBGM() {
   bgmName.value = store.post?.audioName
-    ? store.post.audioName.replace(/[\\/:*?"<>|]/g, ' ').trim() || 'bgm.mp3'
-    : 'bgm.mp3'
+    ? store.post.audioName.replace(/[\\/:*?"<>|]/g, ' ').trim() || 'bgm'
+    : 'bgm'
   showBGM.value = true
 }
 
@@ -132,6 +133,10 @@ onMounted(() => {
 })
 
 function onKey(e) {
+  if (store.viewer.open && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    viewerNav(e.key === 'ArrowLeft' ? -1 : 1)
+    return
+  }
   if (e.key === 'Escape') {
     if (store.viewer.open) closeViewer()
     else if (showNotice.value) showNotice.value = false
@@ -363,8 +368,17 @@ function onKey(e) {
       <div v-if="store.viewer.open" class="viewer" @click="closeViewer">
         <div class="viewer-bar">
           <span class="viewer-name">{{ store.viewer.name }}</span>
+          <span v-if="store.viewerList.length > 1 && store.viewerIndex >= 0" class="viewer-counter">
+            {{ store.viewerIndex + 1 }} / {{ store.viewerList.length }}
+          </span>
           <button class="viewer-close" @click.stop="closeViewer">✕</button>
         </div>
+        <button
+          v-if="store.viewerList.length > 1 && store.viewerIndex >= 0"
+          class="viewer-nav prev"
+          title="上一张（←）"
+          @click.stop="viewerNav(-1)"
+        >‹</button>
         <div v-if="store.viewer.loading" class="spinner"></div>
         <img
           v-else
@@ -373,6 +387,12 @@ function onKey(e) {
           @click.stop
           draggable="false"
         />
+        <button
+          v-if="store.viewerList.length > 1 && store.viewerIndex >= 0"
+          class="viewer-nav next"
+          title="下一张（→）"
+          @click.stop="viewerNav(1)"
+        >›</button>
       </div>
     </transition>
 
@@ -453,11 +473,11 @@ function onKey(e) {
           </div>
           <div class="notice-body">
             <p v-if="store.post?.audioName" class="bgm-track">曲目：{{ store.post.audioName }}</p>
-            <p>保存文件名（不输入即默认 <b>bgm.mp3</b>）：</p>
+            <p>保存文件名（不输入即默认 <b>bgm</b>，按实际音频格式补扩展名）：</p>
             <input
               v-model="bgmName"
               class="input bgm-input"
-              placeholder="bgm.mp3"
+              placeholder="bgm"
               spellcheck="false"
               @keyup.enter="confirmBGM"
             />
@@ -738,11 +758,36 @@ function onKey(e) {
 .viewer-name {
   font-size: 13px;
   opacity: 0.85;
-  max-width: 70%;
+  max-width: 60%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.viewer-counter {
+  font-size: 12.5px;
+  opacity: 0.75;
+  margin-left: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.viewer-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 28px;
+  line-height: 0.9;
+  cursor: pointer;
+  transition: background 0.2s var(--spring), transform 0.2s var(--spring);
+}
+.viewer-nav:hover { background: rgba(255, 255, 255, 0.3); transform: translateY(-50%) scale(1.08); }
+.viewer-nav.prev { left: 18px; }
+.viewer-nav.next { right: 18px; }
 .viewer-close {
   appearance: none;
   border: none;
