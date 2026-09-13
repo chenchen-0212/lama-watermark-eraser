@@ -92,3 +92,46 @@ func mapKeys(m map[string]bool) []string {
 	}
 	return out
 }
+
+// TestDownloadBGMStandaloneEmptyURL 空/全空白音频地址应在弹对话框之前就报错，
+// 保证「该帖子没有 BGM」这条边界不会走到保存流程。
+func TestDownloadBGMStandaloneEmptyURL(t *testing.T) {
+	a := &App{} // 空 URL 分支不依赖 Wails ctx
+	for _, in := range []string{"", "   ", "\t\n"} {
+		if got, err := a.DownloadBGMStandalone(in, "bgm"); err == nil {
+			t.Errorf("audioURL=%q 应返回错误，实际得到 %q, nil", in, got)
+		}
+	}
+}
+
+// TestCopyFileStream 单独保存 BGM 用的流式复制：内容一致、目标扩展名补全由调用方负责。
+func TestCopyFileStream(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bgm.mp3")
+	payload := []byte("ID3\x03\x00 fake-audio-payload")
+	if err := os.WriteFile(src, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(dir, "out", "saved.mp3")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileStream(src, dst); err != nil {
+		t.Fatalf("copyFileStream: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("复制内容不一致: %q", got)
+	}
+
+	if err := copyFileStream(filepath.Join(dir, "not_exist.mp3"), dst); err == nil {
+		t.Error("源文件不存在时应返回错误")
+	}
+	if err := copyFileStream(src, filepath.Join(dir, "no_such_dir", "x.mp3")); err == nil {
+		t.Error("目标目录不存在时应返回错误")
+	}
+}

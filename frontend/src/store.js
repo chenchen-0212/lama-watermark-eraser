@@ -3,6 +3,7 @@ import {
   GetThumb,
   DownloadSocial,
   DownloadBGM,
+  DownloadBGMStandalone,
   StartBatch,
   CancelBatch,
   ZipDirectory,
@@ -22,6 +23,7 @@ export const store = reactive({
   inputUrl: '',
   post: null, // {platform,title,author,dir,files,count,audioUrl,audioName}
   bgmSaved: '', // 已保存的 BGM 本地路径（空=未下载）
+  bgmMode: 'standalone', // standalone=另存为独立文件 | bundle=存入源图目录（随 zip 打包）
   sourceThumbs: [], // [{path,thumb,name}]
   cleanedThumbs: [],
   cleanedDir: '',
@@ -75,6 +77,7 @@ export async function startDownload() {
     const post = await DownloadSocial(url)
     store.post = post
     store.bgmSaved = ''
+    store.bgmMode = 'standalone'
     store.selected = []
     store.previewPath = ''
     store.sourceThumbs = []
@@ -130,6 +133,7 @@ export async function loadLocalFolder() {
       audioName: '',
     }
     store.bgmSaved = ''
+    store.bgmMode = 'standalone'
     store.selected = []
     store.previewPath = ''
     store.sourceThumbs = []
@@ -239,19 +243,36 @@ export async function exportSourceZip() {
   }
 }
 
-// 下载 BGM：filename 由用户在弹窗中输入（空则后端兜底 bgm.mp3），保存到帖子图片目录
-// （源图打包 zip 会自动包含）。成功后记录 store.bgmSaved 供按钮回显。
-export async function saveBGM(filename) {
+// 下载 BGM：filename 由用户在弹窗中输入（空则后端兜底 bgm），两种保存方式：
+//   mode='standalone'（默认）→ 弹「另存为」对话框，独立保存到用户指定位置，不写入源图目录，
+//                             因此不会随「源图打包」进 zip；
+//   mode='bundle'            → 存到帖子图片目录（源图打包 zip 会自动包含）。
+// 成功后记录 store.bgmSaved / store.bgmMode 供按钮与弹窗回显。
+export async function saveBGM(filename, mode = 'standalone') {
   const post = store.post
   if (!post || !post.audioUrl) {
     showToast('当前帖子没有可下载的 BGM', 'danger')
     return
   }
   try {
-    const saved = await DownloadBGM(post.audioUrl, post.dir, filename || '')
+    if (mode === 'bundle') {
+      const saved = await DownloadBGM(post.audioUrl, post.dir, filename || '')
+      store.bgmSaved = saved
+      store.bgmMode = 'bundle'
+      log(`BGM 已存入源图目录: ${fileName(saved)}（会随源图打包进 zip）`, 'ok')
+      showToast('BGM 已存入源图目录', 'ok')
+      return
+    }
+    const saved = await DownloadBGMStandalone(post.audioUrl, filename || '')
+    if (!saved) {
+      // 用户在「另存为」对话框点了取消：不是失败，不改动已有状态
+      showToast('已取消保存 BGM', 'info')
+      return
+    }
     store.bgmSaved = saved
-    log(`BGM 已保存: ${fileName(saved)}（含在源图打包中）`, 'ok')
-    showToast('BGM 已保存', 'ok')
+    store.bgmMode = 'standalone'
+    log(`BGM 已单独保存: ${saved}（不在源图 zip 内）`, 'ok')
+    showToast('BGM 已单独保存', 'ok')
   } catch (e) {
     log('BGM 下载失败: ' + e, 'fail')
     showToast('BGM 下载失败: ' + e)

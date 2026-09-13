@@ -10,6 +10,7 @@ const props = defineProps({
 
 const MAX_W = 620
 const MAX_H = 400
+const SNAP = 8 // 边缘吸附阈值（显示像素），框边进入该范围即贴合图像边缘
 
 const stageEl = ref(null)
 const dispW = ref(0)
@@ -19,6 +20,8 @@ const natH = ref(0)
 const rects = ref([]) // 已确认的框选（显示坐标） [{x,y,w,h}]
 const dragRect = ref(null) // 拖拽新建中的框
 const resizing = ref(null) // { index, handle, sx, sy, startRect }
+const moving = ref(null) // { index, sx, sy, startRect }
+const snapGuides = ref({ v: [], h: [] }) // 吸附提示线：v=竖线x坐标，h=横线y坐标
 let dragging = false
 let startX = 0
 let startY = 0
@@ -46,6 +49,8 @@ function onImgLoad(e) {
   rects.value = []
   dragRect.value = null
   resizing.value = null
+  moving.value = null
+  clearGuides()
   store.boxes = []
   store.ratios = []
 }
@@ -97,22 +102,48 @@ function onMove(e) {
     const rs = resizing.value
     const dx = p.x - rs.sx
     const dy = p.y - rs.sy
-    const r = resizeRect(rs.startRect, rs.handle, dx, dy)
-    rects.value[rs.index] = r
+    const cand = resizeRect(rs.startRect, rs.handle, dx, dy)
+    const snap = snapResizeRect(cand, rs.handle)
+    rects.value[rs.index] = snap.rect
+    snapGuides.value = { v: snap.vg, h: snap.hg }
+    syncStore()
+    return
+  }
+  if (moving.value) {
+    const mv = moving.value
+    const s = mv.startRect
+    const maxX = Math.max(0, dispW.value - s.w)
+    const maxY = Math.max(0, dispH.value - s.h)
+    const nx = Math.min(Math.max(0, s.x + (p.x - mv.sx)), maxX)
+    const ny = Math.min(Math.max(0, s.y + (p.y - mv.sy)), maxY)
+    const snap = snapMoveRect({ x: nx, y: ny, w: s.w, h: s.h })
+    rects.value[mv.index] = snap.rect
+    snapGuides.value = { v: snap.vg, h: snap.hg }
+    syncStore()
     return
   }
   if (!dragging) return
-  dragRect.value = {
+  const raw = {
     x: Math.min(startX, p.x),
     y: Math.min(startY, p.y),
     w: Math.abs(p.x - startX),
     h: Math.abs(p.y - startY),
   }
+  const snap = snapEdges(raw)
+  dragRect.value = snap.rect
+  snapGuides.value = { v: snap.vg, h: snap.hg }
 }
 
 function onUp() {
   if (resizing.value) {
     resizing.value = null
+    clearGuides()
+    syncStore()
+    return
+  }
+  if (moving.value) {
+    moving.value = null
+    clearGuides()
     syncStore()
     return
   }
@@ -120,11 +151,76 @@ function onUp() {
   dragging = false
   const r = dragRect.value
   dragRect.value = null
+  clearGuides()
   if (!r || r.w < 4 || r.h < 4) return
   const b = toPixel(r)
   if (b.x2 - b.x1 < 2 || b.y2 - b.y1 < 2) return
   rects.value.push(r)
   syncStore()
+}
+
+function clearGuides() {
+  snapGuides.value = { v: [], h: [] }
+}
+
+// 新建框：四条边各自独立吸附（角点由鼠标自由张合，可分别贴边）
+function snapEdges(r) {
+  let x1 = r.x
+  let y1 = r.y
+  let x2 = r.x + r.w
+  let y2 = r.y + r.h
+  const vg = []
+  const hg = []
+  if (Math.abs(x1) <= SNAP) { x1 = 0; vg.push(0) }
+  if (Math.abs(x2 - dispW.value) <= SNAP) { x2 = dispW.value; vg.push(dispW.value) }
+  if (Math.abs(y1) <= SNAP) { y1 = 0; hg.push(0) }
+  if (Math.abs(y2 - dispH.value) <= SNAP) { y2 = dispH.value; hg.push(dispH.value) }
+  return {
+    rect: { x: x1, y: y1, w: Math.max(2, x2 - x1), h: Math.max(2, y2 - y1) },
+    vg, hg,
+  }
+}
+
+// 移动：整体平移吸附，保持宽高不变（避免边各自吸附导致变形）
+function snapMoveRect(r) {
+  let x = r.x
+  let y = r.y
+  const vg = []
+  const hg = []
+  if (Math.abs(x) <= SNAP) { x = 0; vg.push(0) }
+  else if (Math.abs(x + r.w - dispW.value) <= SNAP) { x = dispW.value - r.w; vg.push(dispW.value) }
+  if (Math.abs(y) <= SNAP) { y = 0; hg.push(0) }
+  else if (Math.abs(y + r.h - dispH.value) <= SNAP) { y = dispH.value - r.h; hg.push(dispH.value) }
+  return { rect: { x, y, w: r.w, h: r.h }, vg, hg }
+}
+
+// 缩放：仅吸附当前手柄所驱动的那条（些）边，其余边保持不动
+function snapResizeRect(cand, handle) {
+  let x1 = cand.x
+  let y1 = cand.y
+  let x2 = cand.x + cand.w
+  let y2 = cand.y + cand.h
+  const vg = []
+  const hg = []
+  if (handle.indexOf('w') >= 0 && Math.abs(x1) <= SNAP) { x1 = 0; vg.push(0) }
+  if (handle.indexOf('e') >= 0 && Math.abs(x2 - dispW.value) <= SNAP) { x2 = dispW.value; vg.push(dispW.value) }
+  if (handle.indexOf('n') >= 0 && Math.abs(y1) <= SNAP) { y1 = 0; hg.push(0) }
+  if (handle.indexOf('s') >= 0 && Math.abs(y2 - dispH.value) <= SNAP) { y2 = dispH.value; hg.push(dispH.value) }
+  return {
+    rect: { x: x1, y: y1, w: Math.max(2, x2 - x1), h: Math.max(2, y2 - y1) },
+    vg, hg,
+  }
+}
+
+function startMove(i, e) {
+  if (!dispW.value) return
+  const p = stageXY(e)
+  moving.value = {
+    index: i,
+    sx: p.x,
+    sy: p.y,
+    startRect: { ...rects.value[i] },
+  }
 }
 
 function startResize(i, handle, e) {
@@ -161,6 +257,8 @@ function resizeRect(start, handle, dx, dy) {
 function removeBox(i) {
   rects.value.splice(i, 1)
   resizing.value = null
+  moving.value = null
+  clearGuides()
   syncStore()
 }
 
@@ -168,6 +266,8 @@ function clearBoxes() {
   rects.value = []
   dragRect.value = null
   resizing.value = null
+  moving.value = null
+  clearGuides()
   syncStore()
 }
 
@@ -177,6 +277,25 @@ const rectStyle = (r) => ({
   width: r.w + 'px',
   height: r.h + 'px',
 })
+
+// 删除按钮默认浮在框右上角外侧；贴近画布边缘时依次退到左侧/下方，避免被画布裁掉
+function xBtnStyle(r) {
+  const m = 26 // 按钮直径 20 + 6 间隙
+  const s = { left: 'auto', right: 'auto', top: 'auto', bottom: 'auto' }
+  const spaceRight = dispW.value - (r.x + r.w)
+  const spaceAbove = r.y
+  const spaceBelow = dispH.value - (r.y + r.h)
+
+  if (spaceRight >= m) s.right = '-26px'
+  else if (r.x >= m) s.left = '-26px'
+  else s.right = '3px'
+
+  if (spaceAbove >= m) s.top = '-26px'
+  else if (spaceBelow >= m) s.bottom = 'calc(100% + 6px)'
+  else s.top = '3px'
+
+  return s
+}
 
 function handleStyle(r, h) {
   const cx = { nw: 0, n: 0.5, ne: 1, e: 1, se: 1, s: 0.5, sw: 0, w: 0 }[h]
@@ -189,7 +308,7 @@ function handleStyle(r, h) {
 }
 
 const infoText = computed(() => {
-  if (!store.boxes.length) return '水印区域: 未框选（可拖拽框选多个，拖动手柄调整大小）'
+  if (!store.boxes.length) return '水印区域: 未框选（拖拽框选多个，拖动框可移动，接触图像边缘自动吸附）'
   const parts = store.boxes.map((b, i) => {
     const [x1, y1, x2, y2] = b
     return `${i + 1}: (${x1},${y1})-(${x2},${y2})`
@@ -203,6 +322,8 @@ watch(
     rects.value = []
     dragRect.value = null
     resizing.value = null
+    moving.value = null
+    clearGuides()
     store.boxes = []
     store.ratios = []
   }
@@ -221,14 +342,31 @@ watch(
       @mouseleave="onUp"
     >
       <img v-if="src" :src="src" draggable="false" @load="onImgLoad" />
+      <!-- 吸附提示线 -->
+      <div
+        v-for="(gx, i) in snapGuides.v"
+        :key="'vg' + i"
+        class="wm-guide v"
+        :style="{ left: Math.min(gx, Math.max(0, dispW - 2)) + 'px' }"
+      ></div>
+      <div
+        v-for="(gy, i) in snapGuides.h"
+        :key="'hg' + i"
+        class="wm-guide h"
+        :style="{ top: Math.min(gy, Math.max(0, dispH - 2)) + 'px' }"
+      ></div>
       <div
         v-for="(r, i) in rects"
         :key="'r' + i"
         class="wm-rect"
+        :class="{ moving: moving && moving.index === i }"
         :style="rectStyle(r)"
+        :title="`拖动可移动第 ${i + 1} 个区域`"
+        @mousedown.stop.prevent="startMove(i, $event)"
       >
         <button
           class="wm-rect-x"
+          :style="xBtnStyle(r)"
           :title="`删除第 ${i + 1} 个区域`"
           @mousedown.stop
           @click.stop="removeBox(i)"
@@ -242,7 +380,7 @@ watch(
         ></span>
       </div>
       <div v-if="dragRect" class="wm-rect drag" :style="rectStyle(dragRect)"></div>
-      <div v-if="!rects.length && !dragRect && src" class="wm-hint">按住左键拖拽框选水印区域（可框选多个，拖动手柄调整大小）</div>
+      <div v-if="!rects.length && !dragRect && src" class="wm-hint">按住左键拖拽框选水印区域（可框选多个；拖动框可移动，接触图像边缘自动吸附）</div>
     </div>
     <div class="wm-info">
       <span>{{ infoText }}</span>
@@ -280,16 +418,35 @@ watch(
   border: 2px solid var(--danger);
   background: rgba(255, 69, 58, 0.15);
   border-radius: 2px;
-  pointer-events: none;
+  pointer-events: auto;
+  cursor: move;
+}
+.wm-rect.moving {
+  background: rgba(255, 69, 58, 0.28);
+  box-shadow: 0 0 0 1px rgba(255, 69, 58, 0.35), 0 4px 14px rgba(255, 69, 58, 0.25);
 }
 .wm-rect.drag {
   border-style: dashed;
   background: rgba(255, 69, 58, 0.1);
+  pointer-events: none;
+  cursor: crosshair;
+}
+.wm-guide {
+  position: absolute;
+  background: var(--accent, #0a84ff);
+  box-shadow: 0 0 6px rgba(10, 132, 255, 0.65);
+  pointer-events: none;
+  z-index: 3;
+  animation: wm-guide-in 0.12s ease-out;
+}
+.wm-guide.v { width: 2px; top: 0; bottom: 0; }
+.wm-guide.h { height: 2px; left: 0; right: 0; }
+@keyframes wm-guide-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 .wm-rect-x {
   position: absolute;
-  top: -26px;
-  right: -26px;
   width: 20px;
   height: 20px;
   border-radius: 50%;
@@ -305,6 +462,7 @@ watch(
   justify-content: center;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
   transition: transform 0.15s var(--spring-bounce);
+  z-index: 4;
 }
 .wm-rect-x:hover { transform: scale(1.2); }
 .wm-handle {

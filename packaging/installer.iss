@@ -1,9 +1,13 @@
 ﻿; Inno Setup 6 安装脚本 —— 社媒图文水印抹除工具
 ;
 ; 编译（在项目根目录执行）:
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.3 packaging\installer.iss
+;   （不传 /DMyAppVersion 时用下方默认值）
 ; 产物:
-;   build\installer\社媒图文水印抹除工具_Setup_1.1.2.exe
+;   build\installer\社媒图文水印抹除工具_Setup_1.1.3.exe
+; 一键脚本（Windows）:
+;   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+;   该脚本自动读取 wails.json 的 productVersion 并通过 /D 传入，无需手改本文件。
 ;
 ; 说明:
 ;   - lamacore\ 为 PyInstaller onedir 引擎束（含 big-lama.pt，约 670MB），
@@ -15,7 +19,10 @@
 ;   - 本文件含中文，必须以 UTF-8（带 BOM）保存，否则 ISCC 按 ANSI 解析会乱码。
 
 #define MyAppName "社媒图文水印抹除工具"
-#define MyAppVersion "1.1.2"
+; 版本号默认值 = 发布版本；单次编译可用 ISCC /DMyAppVersion=x.y.z 覆盖
+#ifndef MyAppVersion
+  #define MyAppVersion "1.1.3"
+#endif
 #define MyAppPublisher "csy"
 #define MyAppExeName "社媒图文水印抹除工具.exe"
 

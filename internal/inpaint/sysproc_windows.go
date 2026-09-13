@@ -16,3 +16,7 @@ func hideEngineWindowSysProcAttr() *syscall.SysProcAttr {
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
 }
+
+// killProcessGroup Windows 侧整树回收由 taskkill /F /T 完成（见 killProcessTree），
+// 此处无需额外动作。
+func killProcessGroup(pid int) {}

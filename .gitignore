@@ -2,7 +2,7 @@
 build/*
 *.exe
 
-# 发布用安装器 exe 例外（经 Git LFS 入库）
+# 发布用安装器例外（经 Git LFS 入库）
 !build/installer/
 build/installer/*
 !build/installer/*.exe
@@ -22,3 +22,5 @@ __pycache__/
 python_engine/venv/
 python_engine/build/
 python_engine/dist/
+# 权重文件（205MB，走 LAMA_MODEL_SRC 注入，不入库）
+python_engine/big-lama.pt

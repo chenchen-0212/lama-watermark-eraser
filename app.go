@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/draw"
 	"image/jpeg"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -264,6 +265,76 @@ func (a *App) DownloadBGM(audioURL, dir, filename string) (string, error) {
 	return downloader.SaveAudio(ctx, audioURL, dir, filename)
 }
 
+// DownloadBGMStandalone 单独下载 BGM：先下到系统临时目录（拿到按 Content-Type
+// 解析出的真实扩展名），再弹「另存为」对话框让用户指定位置，复制过去后清理临时文件。
+//
+// 与 DownloadBGM 的区别：全程不写入源图目录，因此不会随「源图打包」进 zip，
+// 适合只想单独留存 BGM 的场景。用户取消对话框返回空字符串且不报错（取消不是失败）。
+func (a *App) DownloadBGMStandalone(audioURL, filename string) (string, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(audioURL) == "" {
+		return "", fmt.Errorf("该帖子没有可下载的 BGM")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "lama-bgm-*")
+	if err != nil {
+		return "", fmt.Errorf("创建临时目录失败: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpFile, err := downloader.SaveAudio(ctx, audioURL, tmpDir, filename)
+	if err != nil {
+		return "", err
+	}
+
+	dst, err := runtime.SaveFileDialog(ctx, runtime.SaveDialogOptions{
+		Title:                "另存背景音乐到…",
+		DefaultFilename:      filepath.Base(tmpFile),
+		CanCreateDirectories: true,
+		Filters: []runtime.FileFilter{
+			{DisplayName: "音频文件", Pattern: "*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac"},
+			{DisplayName: "所有文件", Pattern: "*.*"},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(dst) == "" {
+		return "", nil // 用户取消保存
+	}
+	// 用户未填扩展名时补上源文件扩展名，避免存出无后缀文件
+	if filepath.Ext(dst) == "" {
+		dst += filepath.Ext(tmpFile)
+	}
+	if err := copyFileStream(tmpFile, dst); err != nil {
+		return "", fmt.Errorf("保存失败: %w", err)
+	}
+	return dst, nil
+}
+
+// copyFileStream 流式复制，避免把音频整段读进内存。
+func copyFileStream(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
 // ---------------------------------------------------------- 步骤4 去水印
 
 // StartBatch 批量去水印（异步执行，进度经 batch:progress 事件推送）。
@@ -509,12 +580,23 @@ func workspaceDir() string {
 	return dir
 }
 
-// appDataDir 应用数据目录：%LOCALAPPDATA%/LaMaWatermarkRemover。
-// 用于 workspace、平台 Cookie 持久化等。
+// appDataDir 应用数据目录，用于 workspace、平台 Cookie 持久化等：
+//   - Windows: %LOCALAPPDATA%\LaMaWatermarkRemover
+//   - macOS:   ~/Library/Application Support/LaMaWatermarkRemover
+//   - 其他:    用户缓存目录/LaMaWatermarkRemover
+//
+// 注意：本文件已导入 Wails 的 runtime 包，故不引入标准库 runtime，
+// 改用「环境变量优先 + 平台标准目录回退」的等价判定。
 func appDataDir() string {
-	base := os.Getenv("LOCALAPPDATA")
+	base := os.Getenv("LOCALAPPDATA") // 仅 Windows 有值
 	if base == "" {
-		base, _ = os.UserCacheDir()
+		if cfg, err := os.UserConfigDir(); err == nil {
+			base = cfg
+		} else if cache, err := os.UserCacheDir(); err == nil {
+			base = cache
+		} else {
+			base = "."
+		}
 	}
 	dir := filepath.Join(base, "LaMaWatermarkRemover")
 	_ = os.MkdirAll(dir, 0o755)

@@ -89,23 +89,26 @@ async function clearCookie() {
   }
 }
 
-// BGM 保存弹窗：默认名 bgm.mp3，确认后经后端下载到帖子图片目录
+// BGM 保存弹窗：默认名取自曲目名，确认后按所选方式保存
+// （standalone=另存为独立文件，不进源图 zip；bundle=存入源图目录，随 zip 打包）
 const hasBGM = computed(() => !!(store.post && store.post.audioUrl))
 const showBGM = ref(false)
 const bgmName = ref('bgm.mp3')
+const bgmMode = ref('standalone')
 const bgmSaving = ref(false)
 
 function openBGM() {
   bgmName.value = store.post?.audioName
     ? store.post.audioName.replace(/[\\/:*?"<>|]/g, ' ').trim() || 'bgm'
     : 'bgm'
+  bgmMode.value = store.bgmMode || 'standalone'
   showBGM.value = true
 }
 
 async function confirmBGM() {
   bgmSaving.value = true
   try {
-    await saveBGM(bgmName.value.trim())
+    await saveBGM(bgmName.value.trim(), bgmMode.value)
     showBGM.value = false
   } finally {
     bgmSaving.value = false
@@ -124,6 +127,18 @@ function backToAdjust() {
 // 点击图片 → 设为上方预览/操作对象
 function onPreview(path) {
   store.previewPath = path
+}
+
+// fn 区间选中反馈（ImageGrid 已写入 store.selected）
+function onRange(e) {
+  if (!e || !e.added) return
+  showToast(`已选中第 ${e.from + 1}–${e.to + 1} 张，共 ${e.count} 张`, 'ok')
+}
+
+// 取消全部选中反馈（单张取消由网格内的状态条实时反映，不弹 toast 避免打扰）
+function onDeselectAll(e) {
+  if (!e || !e.count) return
+  showToast(`已取消全部选中（${e.count} 张）`, 'info')
 }
 
 onMounted(() => {
@@ -296,12 +311,12 @@ function onKey(e) {
                     :class="{ 'bgm-done': !!store.bgmSaved }"
                     :disabled="store.running"
                     @click="openBGM"
-                    :title="store.post.audioName ? `曲目：${store.post.audioName}` : '下载该图文的背景音乐'"
+                    :title="store.post.audioName ? `曲目：${store.post.audioName}（可单独下载，也可放入源图 zip）` : '下载该图文的背景音乐'"
                   >
                     {{ store.bgmSaved ? '🎵 BGM 已下载' : '🎵 下载BGM' }}
                   </button>
                 </div>
-                <p class="tip">可拖拽框选多个水印区域；点区域右上角 ✕ 可删除单个，点「清空」全部删除。</p>
+                <p class="tip">可拖拽框选多个水印区域；框内按住拖动可整体移动，框边贴到图像边缘会自动吸附对齐；点区域 ✕ 删除单个，点「清空」全部删除。</p>
                 <p v-if="!engineReady" class="tip engine-status">
                   {{ store.engineStatus === 'error' ? '⚠️' : '⏳' }}
                   {{ store.engineMessage || 'AI 引擎启动中…' }}
@@ -314,10 +329,17 @@ function onKey(e) {
           </div>
           <div class="card grid-wrap card-pad">
             <div class="grid-head">
-              <span class="grid-title">已下载 {{ store.sourceThumbs.length }} 张（点左上角 ☑ 勾选，点图片预览）</span>
+              <span class="grid-title">已下载 {{ store.sourceThumbs.length }} 张（点左上角 ☑ 勾选；按住 fn / Shift 再点一张＝选中区间；已选中的图可点「✕ 取消」或右键取消；点图片预览）</span>
               <button class="btn btn-ghost" @click="store.stage = 'idle'">换一个链接</button>
             </div>
-            <ImageGrid :images="store.sourceThumbs" selectable :active-path="previewItem?.path || ''" @preview="onPreview" />
+            <ImageGrid
+              :images="store.sourceThumbs"
+              selectable
+              :active-path="previewItem?.path || ''"
+              @preview="onPreview"
+              @range="onRange"
+              @deselect-all="onDeselectAll"
+            />
           </div>
         </section>
       </transition>
@@ -481,7 +503,18 @@ function onKey(e) {
               spellcheck="false"
               @keyup.enter="confirmBGM"
             />
-            <p v-if="store.bgmSaved" class="bgm-saved-tip">已保存：{{ store.bgmSaved }}（重复确定将覆盖）</p>
+            <p class="bgm-label">保存方式：</p>
+            <label class="bgm-mode">
+              <input type="radio" value="standalone" v-model="bgmMode" />
+              <span>单独下载（另存为…）<em>独立文件，不进入源图 zip</em></span>
+            </label>
+            <label class="bgm-mode">
+              <input type="radio" value="bundle" v-model="bgmMode" />
+              <span>放入源图目录<em>随「源图打包」一起压缩进 zip</em></span>
+            </label>
+            <p v-if="store.bgmSaved" class="bgm-saved-tip">
+              已保存：{{ store.bgmSaved }}（{{ store.bgmMode === 'bundle' ? '在源图目录内，会随 zip 打包' : '独立文件，不在 zip 内' }}；重复确定将覆盖）
+            </p>
           </div>
           <div class="notice-foot">
             <button class="btn" :disabled="bgmSaving" @click="showBGM = false">取消</button>
@@ -683,6 +716,24 @@ function onKey(e) {
 .bgm-panel .notice-body p { margin: 8px 0 0; color: var(--text-2); font-size: 12.5px; }
 .bgm-track { color: var(--text) !important; font-weight: 600; }
 .bgm-input { margin-top: 8px; }
+.bgm-panel .notice-body .bgm-label { margin-top: 14px; }
+.bgm-mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 7px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.bgm-mode input { margin-top: 2px; accent-color: var(--accent); flex-shrink: 0; }
+.bgm-mode em {
+  display: block;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
 .bgm-saved-tip { color: var(--text-3) !important; font-size: 11.5px !important; word-break: break-all; }
 .bgm-done { color: var(--ok, #30d158); }
 .platforms { margin-top: 18px; display: flex; gap: 8px; justify-content: center; }

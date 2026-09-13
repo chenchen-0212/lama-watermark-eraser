@@ -5,11 +5,13 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/mac"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 
 	"lama-watermark-eraser/internal/cli"
@@ -32,20 +34,13 @@ func main() {
 		}
 	}
 
-	// 引擎资源说明：ONNX 内嵌资源已移除，改为伴生 lamacore/lamacore.exe
+	// 引擎资源说明：ONNX 内嵌资源已移除，改为伴生 lamacore/lamacore(.exe)
 	// （Python big-lama 子进程，见 resources.LocatePythonEngine）。
 	// 引擎定位与预热在 app.startup 中后台完成，状态经 engine:status 事件推送前端。
 
-	// WebView2 用户数据目录显式指定，避免 APPDATA 缺失/受限环境下的创建失败
-	wvDataDir := filepath.Join(os.Getenv("LOCALAPPDATA"), "LaMaWatermarkRemover", "webview2")
-	if os.Getenv("LOCALAPPDATA") == "" {
-		wvDataDir = filepath.Join(".", "webview2-data")
-	}
-	_ = os.MkdirAll(wvDataDir, 0o755)
-
 	app := NewApp()
 
-	err := wails.Run(&options.App{
+	opts := &options.App{
 		Title:     "社媒图文去水印工作台",
 		Width:     1080,
 		Height:    760,
@@ -60,17 +55,41 @@ func main() {
 		Bind: []interface{}{
 			app,
 		},
-		Windows: &windows.Options{
+	}
+
+	// 平台专属选项：Windows 显式指定 WebView2 数据目录（避免 APPDATA 受限时
+	// 创建失败）；macOS 提供「关于」信息。二者互不影响，跨平台编译均合法。
+	if runtime.GOOS == "windows" {
+		opts.Windows = &windows.Options{
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
 			DisableWindowIcon:    false,
-			WebviewUserDataPath:  wvDataDir,
-		},
-	})
+			WebviewUserDataPath:  webviewDataDir(),
+		}
+	} else {
+		opts.Mac = &mac.Options{
+			About: &mac.AboutInfo{
+				Title:   "社媒图文水印抹除工具",
+				Message: "Go + Wails + Vue3 + big-lama 去水印流水线",
+			},
+		}
+	}
 
-	if err != nil {
+	if err := wails.Run(opts); err != nil {
 		println("Error:", err.Error())
 	}
+}
+
+// webviewDataDir 返回 WebView2 用户数据目录（仅 Windows 使用；显式指定可避免
+// APPDATA 缺失/受限环境下的创建失败）。
+func webviewDataDir() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = "."
+	}
+	dir := filepath.Join(base, "LaMaWatermarkRemover", "webview2")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
 }
 
 func hasFlag(args []string, name string) bool {

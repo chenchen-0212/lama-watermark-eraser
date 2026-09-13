@@ -7,12 +7,16 @@
 > 技术栈：Go 1.25 + Wails v2.15 + Vue 3 + Python(big-lama PyTorch) 常驻子进程引擎（IOPaint 对齐）
 > 上游：[advimman/lama](https://github.com/advimman/lama)（Apache-2.0）· 下载能力设计参考 [zinan92/content-downloader](https://github.com/zinan92/content-downloader)（MIT）
 
-## 下载安装（Windows）
+## 下载安装
 
-最新发布版：tag [`v1.1.1-installer`](https://github.com/chenchen-0212/lama-watermark-eraser/releases/tag/v1.1.1-installer)，安装包 `社媒图文水印抹除工具_Setup_1.1.1.exe`（约 300MB，经 Git LFS 分发，内含 big-lama 权重与完整引擎，无需额外下载模型）。
+当前版本：**1.1.3**
 
-- 双击安装即可，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限
-- 安装器提供中文界面，可自定义安装目录；含卸载入口
+| 平台 | 安装包 | 安装方式 |
+|---|---|---|
+| Windows 10/11 (x64) | `社媒图文水印抹除工具_Setup_1.1.3.exe`（约 300MB，经 Git LFS 分发） | 双击安装，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限；中文界面，可自定义安装目录；含卸载入口 |
+| macOS (Apple Silicon) | `社媒图文水印抹除工具_1.1.3_arm64.dmg` | 打开镜像，把应用拖入「应用程序」。应用为 ad-hoc 签名（未公证），首次打开需右键 →「打开」放行，详见镜像内《首次打开说明.txt》 |
+
+- 两个安装包都已内置 big-lama 权重与完整推理引擎，**无需额外下载模型**
 - 兼容非 ASCII 安装路径；卸载/退出时自动回收引擎子进程
 
 ## 功能特性
@@ -73,8 +77,14 @@
 │   ├── worker.py            # stdin/stdout JSONL 常驻子进程
 │   ├── lamacore.spec        # PyInstaller onedir 配置
 │   ├── align_smoke.py       # 打包前像素级对齐自测
-│   ├── build_engine.bat     # 一键构建脚本
+│   ├── build_engine.bat     # 一键构建脚本（Windows）
+│   ├── build_engine.sh      # 一键构建脚本（macOS / Linux）
 │   └── requirements.txt     # 依赖（torch CPU / numpy / pillow）
+├── packaging/               # 打包脚本
+│   ├── installer.iss        # Inno Setup 6 安装器脚本（Windows）
+│   ├── build_windows.ps1    # Windows 一键打包：引擎 + 主程序 + 安装器
+│   ├── package_macos.sh     # macOS：集成 lamacore + ad-hoc 签名
+│   └── make_dmg.sh          # macOS：生成 DMG 安装器
 └── frontend/                # Vue3 流水线界面（Apple 流体设计）
 ```
 
@@ -138,14 +148,39 @@ wails build -platform windows/amd64 -webview2 embed
 
 ```bat
 :: 先完成上述引擎与主程序编译，并确认 build/bin/ 下已就位主 exe 与 lamacore\ 目录
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.3 packaging\installer.iss
 :: 产物：build\installer\社媒图文水印抹除工具_Setup_<版本>.exe
 ```
 
-安装脚本要点（详见 `packaging/installer.iss`）：按用户安装（`PrivilegesRequired=lowest`，
+按用户安装（`PrivilegesRequired=lowest`，
 默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`）、中文界面、目录页强制显示、
 非 ASCII 安装路径兼容；lamacore 整目录以 lzma2/max 压缩递归打包。
-版本号在 `installer.iss` 头部 `#define MyAppVersion` 统一维护。
+
+一键打包（引擎 + 主程序 + 安装器，版本号自动读取 `wails.json`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+# 可选：-SkipEngine（复用已有引擎，省几十分钟） -SkipApp（只重打安装器） -Version 1.1.3
+```
+
+版本号单一来源：`wails.json` 的 `productVersion`（macOS 的 `CFBundleShortVersionString`
+与 Windows 安装器版本都由它派生）；`installer.iss` 内的 `MyAppVersion` 仅作默认兜底，
+打包脚本会通过 `/DMyAppVersion=` 覆盖。
+
+### 打包 macOS 安装器（DMG）
+
+```bash
+# 1) 编译 .app（Apple Silicon）
+wails build -platform darwin/arm64
+# 2) 集成 lamacore 引擎 + ad-hoc 签名
+bash packaging/package_macos.sh
+# 3) 生成 DMG 安装器（含 Applications 拖拽链接与首次打开说明）
+bash packaging/make_dmg.sh
+# 产物：build/installer/社媒图文水印抹除工具_<版本>_arm64.dmg
+```
+
+macOS 包为 **ad-hoc 签名**（未做 Apple 公证），首次打开需右键 →「打开」放行；
+对外分发需 Apple Developer ID 签名并公证。
 
 ### 开发期（不打包，直接驱动本机 Python）
 

@@ -414,13 +414,17 @@ func (e *PythonEngine) drainStderr(r io.Reader) {
 	}
 }
 
-// killProcessTree 尽力杀净整棵进程树（Windows taskkill /F /T；其余平台兜底 Kill）。
+// killProcessTree 尽力杀净整棵进程树。
+// Windows 用 taskkill /F /T；类 Unix 平台向子进程所在的独立进程组发 SIGKILL
+// （子进程启动时已 Setpgid，见 sysproc_unix.go），最后兜底 Kill 直接子进程。
 func killProcessTree(pid int) {
 	if runtime.GOOS == "windows" {
 		c := exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid))
 		c.Stdout = io.Discard
 		c.Stderr = io.Discard
 		_ = c.Run()
+	} else {
+		killProcessGroup(pid)
 	}
 	if p, err := os.FindProcess(pid); err == nil {
 		_ = p.Kill()

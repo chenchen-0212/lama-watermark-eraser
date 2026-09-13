@@ -18,6 +18,10 @@ export function DownloadBGM(arg1, arg2, arg3) {
   return window['go']['main']['App']['DownloadBGM'](arg1, arg2, arg3);
 }
 
+export function DownloadBGMStandalone(arg1, arg2) {
+  return window['go']['main']['App']['DownloadBGMStandalone'](arg1, arg2);
+}
+
 export function DownloadSocial(arg1) {
   return window['go']['main']['App']['DownloadSocial'](arg1);
 }
