@@ -1,11 +1,9 @@
 import { reactive } from 'vue'
 import {
   GetThumb,
-  DownloadSocial,
   DownloadBGM,
   DownloadBGMStandalone,
   StartBatch,
-  CancelBatch,
   ZipDirectory,
   PickSaveFile,
   CopyFile,
@@ -53,10 +51,8 @@ export const store = reactive({
   viewerList: [], // 放大浮层当前的图片列表（用于左右切换）
   viewerIndex: -1, // 当前查看的图片在列表中的下标（-1=不在列表中）
 
-  // ---------------- 批处理任务队列（PRD §4） ----------------
+  // ---------------- 批处理任务队列 ----------------
   queue: [], // 队列任务快照（由 queue:updated 全量同步）
-  pageTaskId: null, // 由第三步「开始去水印」发起的任务 ID（用于 batch:* 事件防串扰：
-  // 后台队列任务的双路推送不得推进当前页面的流水线状态机，PRD §5.1）
 })
 
 let toastTimer = null
@@ -78,39 +74,27 @@ function timeStr() {
 }
 
 // ---------------- 流水线动作 ----------------
+// 自动入队模式（方案 v1.2）：下载与去水印点击后立即入队并留在当前页，
+// 不切换到等待页；进度与终态在「任务队列」面板可视，完成后 toast 提醒。
 
 export async function startDownload() {
   const url = store.inputUrl.trim()
   if (!url) return
-  store.stage = 'downloading'
-  store.running = true
-  log('开始下载: ' + url)
+  log('提交下载: ' + url)
   try {
-    const post = await DownloadSocial(url)
-    store.post = post
-    store.bgmSaved = ''
-    store.bgmMode = 'standalone'
-    store.selected = []
-    store.previewPath = ''
-    store.sourceThumbs = []
-    for (const p of post.files) {
-      try {
-        const t = await GetThumb(p, 420)
-        store.sourceThumbs.push({ path: p, thumb: t.thumb, name: fileName(p), width: t.width, height: t.height })
-      } catch (e) {
-        // 缩略图失败也保留条目，避免图片从网格中消失
-        log(`缩略图生成失败: ${fileName(p)}`, 'fail')
-        store.sourceThumbs.push({ path: p, thumb: '', name: fileName(p), width: 0, height: 0, failed: true })
-      }
+    // 复用批量入队（内部按空白拆分，单/多链接通用）；直连下载已移除（方案 O7）
+    const report = await AddQueueTasks([url])
+    const okN = report?.tasks?.length || 0
+    if (okN > 0) {
+      showToast('已加入队列，可在任务队列面板查看', 'ok')
+      log(`已加入下载队列（${okN} 个任务）`, 'ok')
     }
-    log(`下载完成: ${post.platform} | ${post.title} | ${post.count} 张`)
-    store.stage = 'downloaded'
+    const fails = report?.failures || []
+    for (const f of fails) log(`链接未入队: ${f.input} — ${f.reason}`, 'fail')
+    if (!okN && fails.length) showToast('未入队：' + fails[0].reason)
   } catch (e) {
-    log('下载失败: ' + e, 'fail')
+    log('入队失败: ' + e, 'fail')
     showToast(String(e))
-    store.stage = 'idle'
-  } finally {
-    store.running = false
   }
 }
 
@@ -123,49 +107,18 @@ export async function loadLocalFolder() {
     return // 用户取消或对话框失败，保持原状
   }
   if (!dir) return
-  store.running = true
-  store.stage = 'downloading'
   log('选择本地文件夹: ' + dir)
   try {
     const files = await ListImages(dir)
     if (!files.length) {
       showToast('该文件夹内没有可处理的图片')
-      store.stage = 'idle'
       return
     }
-    store.post = {
-      platform: '本地文件夹',
-      id: '',
-      title: dir,
-      author: '',
-      dir: dir,
-      files: files,
-      count: files.length,
-      audioUrl: '',
-      audioName: '',
-    }
-    store.bgmSaved = ''
-    store.bgmMode = 'standalone'
-    store.selected = []
-    store.previewPath = ''
-    store.sourceThumbs = []
-    for (const p of files) {
-      try {
-        const t = await GetThumb(p, 420)
-        store.sourceThumbs.push({ path: p, thumb: t.thumb, name: fileName(p), width: t.width, height: t.height })
-      } catch (e) {
-        log(`缩略图生成失败: ${fileName(p)}`, 'fail')
-        store.sourceThumbs.push({ path: p, thumb: '', name: fileName(p), width: 0, height: 0, failed: true })
-      }
-    }
+    await loadMaterialIntoStore('本地文件夹', dir, dir, files)
     log(`已加载 ${files.length} 张本地图片`, 'ok')
-    store.stage = 'downloaded'
   } catch (e) {
     log('加载失败: ' + e, 'fail')
     showToast(String(e))
-    store.stage = 'idle'
-  } finally {
-    store.running = false
   }
 }
 
@@ -174,18 +127,10 @@ export async function startBatch(scopeAll = true) {
     showToast('请先在预览图上拖拽框选水印区域')
     return
   }
-  if (store.engineStatus === 'starting') {
-    showToast('AI 引擎正在启动，请稍候…', 'info')
-    return
-  }
   if (store.engineStatus === 'error') {
     showToast('AI 引擎未就绪：' + (store.engineMessage || '启动失败'), 'danger')
     return
   }
-  store.running = true
-  store.canceling = false
-  store.stage = 'inpainting'
-  store.cleanedThumbs = []
   const relative = store.mode === 'relative'
   const boxes = relative ? store.ratios : store.boxes
   let inDir = store.post.dir
@@ -195,43 +140,25 @@ export async function startBatch(scopeAll = true) {
       log(`仅处理勾选的 ${store.selected.length} 张`)
     }
     const outDir = inDir + '_去水印'
-    store.cleanedDir = outDir
-    // 经队列串行执行（StartBatch 内部包装为 inpaint 任务，PRD §3.2）：
-    // 记录任务 ID，用于把本页发起的 batch:* 事件与后台队列任务区分开。
+    // 点击即入队（方案 O2）：不切页、不置 running，留在框选页可继续操作；
+    // 引擎 starting 态允许入队（排队即等待），error 态已在上方拦截。
     // title 固化帖子标题，队列面板展示用（而非文件路径）。
     const task = await StartBatch(inDir, outDir, {
       boxes, relative, dilate: store.dilate, margin: 64, maskPath: '', strategy: store.strategy,
     }, store.post?.title || store.post?.dir || '')
-    store.pageTaskId = task?.id || null
+    log(`去水印任务已入队: ${task?.title || inDir}`, 'ok')
+    showToast('已加入队列，可在任务队列面板查看', 'ok')
   } catch (e) {
-    log('启动失败: ' + e, 'fail')
+    log('入队失败: ' + e, 'fail')
     showToast(String(e))
-    store.running = false
-    store.canceling = false
-    store.stage = 'downloaded'
   }
 }
 
-export function cancelBatch() {
-  if (store.canceling) return
-  store.canceling = true
-  log('已请求取消，正在停止…', 'fail')
-  showToast('正在取消…', 'info')
-  // 页面发起的任务按 ID 精确取消（可能仍在排队尚未执行）；
-  // 兜底 CancelBatch 取消当前运行中的批次（旧行为）。
-  const p = store.pageTaskId
-    ? CancelQueueTask(store.pageTaskId).catch(() => CancelBatch())
-    : Promise.resolve().then(() => CancelBatch())
-  p.catch((e) => {
-    store.canceling = false
-    log('取消失败: ' + e, 'fail')
-    showToast('取消失败: ' + e)
-  })
-}
+// ---------------- 批处理任务队列（面板辅助动作） ----------------
 
-// ---------------- 批处理任务队列（PRD §2.2/§4.2） ----------------
-
-// 批量解析并加入队列：输入按空白/逗号/分号（含全角）拆分为多条链接
+// 批量解析并加入队列：输入按空白/逗号/分号（含全角）拆分为多条链接。
+// 已无独立 UI 入口（批量 textarea 已隐藏），其拆分逻辑由 startDownload 复用；
+// 保留本函数供「任务队列」面板未来扩展与开关回滚。
 export async function addQueueTasks(rawInput) {
   const urls = String(rawInput || '')
     .split(/[\s,;，；]+/)
@@ -258,7 +185,9 @@ export async function addQueueTasks(rawInput) {
   }
 }
 
-// 固化当前框选参数，建去水印任务入队（不打断当前页面；scopeAll 与 startBatch 一致）
+// 固化当前框选参数，建去水印任务入队。
+// 【已无 UI 入口】「+ 加入队列」按钮已随自动入队改造移除（startBatch 与其实现
+// 完全同构）；保留本函数仅作开关回滚（SHOW_MANUAL_QUEUE_ENTRY）之用。
 export async function enqueueInpaint(scopeAll = true) {
   if (!store.boxes.length) {
     showToast('请先在预览图上拖拽框选水印区域')
@@ -283,7 +212,7 @@ export async function enqueueInpaint(scopeAll = true) {
 }
 
 // 打开已完成去水印任务的结果页（队列面板「查看结果」入口）：
-// 载入结果目录缩略图并切到第五步，直接可执行「导出 zip」。
+// 立即切到结果页，缩略图后台渐进加载（点「查看结果」不再卡顿），可直接导出 zip。
 export async function openTaskResult(task) {
   if (!task?.resultDir) {
     showToast('该任务没有结果目录', 'danger')
@@ -296,12 +225,14 @@ export async function openTaskResult(task) {
       return
     }
     store.cleanedDir = task.resultDir
-    store.cleanedThumbs = []
-    await loadCleanedThumbs(task.resultDir, files)
+    store.cleanedThumbs = files.map((p) => ({
+      path: p, thumb: '', name: fileName(p), width: 0, height: 0, loading: true,
+    }))
     store.running = false
     store.canceling = false
     store.stage = 'inpainted'
-    log(`已打开任务结果: ${task.resultDir}（${files.length} 张），可导出 zip`, 'ok')
+    log(`已打开任务结果: ${task.resultDir}（${files.length} 张），缩略图加载中…`)
+    await fillThumbs(store.cleanedThumbs)
   } catch (e) {
     log('打开任务结果失败: ' + e, 'fail')
     showToast('打开结果失败: ' + e)
@@ -352,7 +283,7 @@ export async function clearFinishedQueue(type = '') {
   }
 }
 
-// 载入已完成下载任务的素材，进入第三步框选（PRD §2.2 入口二「去框选」）。
+// 载入已完成下载任务的素材，进入框选页（队列面板「去框选」）。
 // 优先使用任务记录的图片清单（task.files，本次下载的确切文件、已按内容去重），
 // 仅在清单缺失时回退列目录——避免把目录里的历史残留文件混入造成图片重复。
 export async function loadTaskMaterial(task) {
@@ -377,8 +308,10 @@ export async function loadTaskMaterial(task) {
   }
 }
 
-// loadMaterialIntoStore 把一组本地图片装入第三步框选流程（loadLocalFolder 与
-// loadTaskMaterial 共用，避免逻辑重复）。
+// loadMaterialIntoStore 把一组本地图片装入框选流程（loadLocalFolder 与
+// loadTaskMaterial 共用）。
+// 性能关键：先铺占位条目并立即切页（点击秒进），缩略图后台逐张生成、
+// 逐个替换——点「去框选」不再卡在加载上。
 async function loadMaterialIntoStore(platform, title, dir, files) {
   store.post = {
     platform,
@@ -395,18 +328,27 @@ async function loadMaterialIntoStore(platform, title, dir, files) {
   store.bgmMode = 'standalone'
   store.selected = []
   store.previewPath = ''
-  store.sourceThumbs = []
-  store.pageTaskId = null
-  for (const p of files) {
-    try {
-      const t = await GetThumb(p, 420)
-      store.sourceThumbs.push({ path: p, thumb: t.thumb, name: fileName(p), width: t.width, height: t.height })
-    } catch (e) {
-      log(`缩略图生成失败: ${fileName(p)}`, 'fail')
-      store.sourceThumbs.push({ path: p, thumb: '', name: fileName(p), width: 0, height: 0, failed: true })
-    }
-  }
+  store.sourceThumbs = files.map((p) => ({
+    path: p, thumb: '', name: fileName(p), width: 0, height: 0, loading: true,
+  }))
   store.stage = 'downloaded'
+  await fillThumbs(store.sourceThumbs)
+}
+
+// fillThumbs 逐张生成缩略图并就地替换占位条目（渐进出现在网格中）。
+async function fillThumbs(items) {
+  for (const item of items) {
+    try {
+      const t = await GetThumb(item.path, 420)
+      item.thumb = t.thumb
+      item.width = t.width
+      item.height = t.height
+    } catch (e) {
+      item.failed = true
+      log(`缩略图生成失败: ${item.name}`, 'fail')
+    }
+    item.loading = false
+  }
 }
 
 export async function exportZip() {
@@ -491,18 +433,6 @@ export async function saveBGM(filename, mode = 'standalone') {
   }
 }
 
-export async function loadCleanedThumbs(dir, files) {
-  store.cleanedThumbs = []
-  for (const p of files) {
-    try {
-      const t = await GetThumb(p, 420)
-      store.cleanedThumbs.push({ path: p, thumb: t.thumb, name: fileName(p), width: t.width, height: t.height })
-    } catch (e) {
-      store.cleanedThumbs.push({ path: p, thumb: '', name: fileName(p), width: 0, height: 0, failed: true })
-    }
-  }
-}
-
 // 放大查看：加载原图（maxW=0 不缩放）到全屏浮层；记录所在列表用于左右切换
 export async function viewImage(path, list) {
   const items = Array.isArray(list) && list.length ? list : store.cleanedThumbs
@@ -537,77 +467,19 @@ export function closeViewer() {
 }
 
 // ---------------- 事件订阅 ----------------
+// 自动入队模式：无前台等待页，队列执行反馈统一经 queue:* 事件 + toast。
 
 export function initEvents() {
+  // 队列内下载的进度日志（RunDownload 内部发出的过程消息）
   EventsOn('download:progress', (d) => log(d.msg))
-  EventsOn('download:error', (d) => {
-    log('下载错误: ' + d.msg, 'fail')
-    showToast(d.msg)
-  })
-  // batch:progress：仅当事件属于本页发起的任务时推进页面进度；
-  // 后台队列任务的双路推送只进队列面板（PRD §5.1 防串扰）。
-  EventsOn('batch:progress', (d) => {
-    if (d.taskId && d.taskId !== store.pageTaskId) return
-    store.progress = d
-    log(`[${d.index}/${d.total}] ${d.name} ${d.status === 'ok' ? '✓' : d.status === 'skip' ? '- 已取消' : '✗ ' + d.info}`, d.status === 'ok' ? 'ok' : d.status === 'skip' ? '' : 'fail')
-  })
-  EventsOn('batch:done', async (d) => {
-    // 非本页发起的后台任务完成：不推进当前页面的流水线状态机，
-    // 仅记日志提示（页面可能正停留在其他帖子的框选/预览视图）。
-    if (d.taskId && d.taskId !== store.pageTaskId) {
-      if (d.canceled) {
-        log(`后台任务已取消：完成 ${d.ok} / 共 ${d.total}`, 'fail')
-      } else if (d.err) {
-        log(`后台去水印任务失败: ${d.err}`, 'fail')
-      } else {
-        log(`后台去水印完成: 成功 ${d.ok} / 共 ${d.total}（结果目录 ${d.outDir}）`, 'ok')
-      }
-      return
-    }
-    // 本页发起的任务：无论用户是否切走页面，都要释放运行态标志，
-    // 否则「下载图片」等按钮会被永久禁用（stuck running）。
-    store.pageTaskId = null
-    store.running = false
-    store.canceling = false
-    // 任务级失败（全部图片失败 / 执行出错）：明确报错并退回框选页，不静默
-    if (d.err) {
-      log(`去水印任务失败: ${d.err}`, 'fail')
-      showToast('去水印任务失败: ' + d.err, 'danger')
-      if (store.stage === 'inpainting') store.stage = 'downloaded'
-      return
-    }
-    if (d.canceled) {
-      log(`已取消：完成 ${d.ok} / 共 ${d.total}`, 'fail')
-      showToast('已取消抹除', 'info')
-    } else {
-      log(`去水印完成: 成功 ${d.ok} / 共 ${d.total}`, 'ok')
-    }
-    // 仅当用户仍停留在处理中页面时才推进到结果页；若已切走，只提示不打扰
-    const files = await listDirFiles(d.outDir)
-    if (files.length > 0) {
-      store.cleanedDir = d.outDir
-      await loadCleanedThumbs(d.outDir, files)
-      if (store.stage === 'inpainting') {
-        store.stage = 'inpainted'
-      } else {
-        showToast(`去水印完成（${d.ok}/${d.total}），结果已就绪可导出`, 'ok')
-      }
-    } else if (store.stage === 'inpainting') {
-      store.stage = 'downloaded'
-    }
-  })
-  // 队列事件（PRD §4.3）：queue:updated 全量快照；queue:progress 单张进度；
-  // queue:done 后台任务终态提醒（面板数据以 queue:updated 为准，此处只提示）。
+  // 队列事件：queue:updated 全量快照；queue:progress 单张进度；queue:done 终态提醒。
   EventsOn('queue:updated', (d) => {
     store.queue = d?.tasks || []
   })
   EventsOn('queue:progress', (d) => {
     const t = store.queue.find((x) => x.id === d.id)
     if (t) t.progress = { index: d.index, total: d.total, name: d.name, status: d.status }
-    // 本页发起的任务已由 batch:progress 记录日志，避免双份刷屏
-    if (d.id !== store.pageTaskId) {
-      log(`[队列 ${d.index}/${d.total}] ${d.name} ${d.status === 'ok' ? '✓' : d.status === 'skip' ? '- 已取消' : '✗ ' + d.info}`, d.status === 'ok' ? 'ok' : d.status === 'skip' ? '' : 'fail')
-    }
+    log(`[队列 ${d.index}/${d.total}] ${d.name} ${d.status === 'ok' ? '✓' : d.status === 'skip' ? '- 已取消' : '✗ ' + d.info}`, d.status === 'ok' ? 'ok' : d.status === 'skip' ? '' : 'fail')
   })
   EventsOn('queue:done', (d) => {
     const t = store.queue.find((x) => x.id === d.id)
@@ -615,13 +487,17 @@ export function initEvents() {
       t.state = d.state
       t.progress = null
     }
-    if (d.id === store.pageTaskId) return // 本页任务的终态由 batch:done 处理
     if (d.state === 'done') {
-      showToast(`后台任务完成：${d.summary || d.outDir || ''}`, 'ok')
-      log(`后台任务完成: ${d.summary || d.outDir}`, 'ok')
+      if (d.type === 'download') {
+        showToast(`素材下载完成：${d.summary || ''}，可在任务队列点「去框选」`, 'ok')
+        log(`下载任务完成: ${d.summary || d.outDir}`, 'ok')
+      } else {
+        showToast(`去水印完成（${d.summary || ''}），可在任务队列点「查看结果」导出`, 'ok')
+        log(`去水印任务完成: ${d.summary || d.outDir}`, 'ok')
+      }
     } else if (d.state === 'failed') {
-      showToast(`后台任务失败: ${d.err || ''}`, 'danger')
-      log(`后台任务失败: ${d.err}`, 'fail')
+      showToast(`任务失败: ${d.err || ''}（可在任务队列重试）`, 'danger')
+      log(`任务失败: ${d.err}`, 'fail')
     }
   })
   // 引擎状态事件 -> 全局状态 + 日志（error 弹提示，ready/starting 记录日志）
@@ -648,16 +524,6 @@ export function initEvents() {
     })
     .catch(() => {})
   refreshQueue().catch(() => {})
-}
-
-// ---------------- 绑定辅助（目录列表经 PrepareSubset/zip 之外需要列目录） ----------------
-
-async function listDirFiles(dir) {
-  try {
-    return await ListImages(dir)
-  } catch (e) {
-    return []
-  }
 }
 
 function fileName(p) {

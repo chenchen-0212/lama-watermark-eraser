@@ -6,7 +6,6 @@ import {
   startDownload,
   loadLocalFolder,
   startBatch,
-  cancelBatch,
   exportZip,
   exportSourceZip,
   saveBGM,
@@ -15,8 +14,6 @@ import {
   viewImage,
   viewerNav,
   closeViewer,
-  addQueueTasks,
-  enqueueInpaint,
   refreshQueue,
   retryQueueTask,
   cancelQueueTask,
@@ -30,14 +27,10 @@ import { GetAppVersion, GetBGMAudio, GetDouyinCookie, SetDouyinCookie } from '..
 import ImageGrid from './components/ImageGrid.vue'
 import WatermarkCanvas from './components/WatermarkCanvas.vue'
 
-const steps = ['输入链接', '下载图片', '框选去水印', '结果预览', '导出 zip']
-const stepIdx = computed(
-  () =>
-    ({ idle: 0, downloading: 1, downloaded: 2, inpainting: 3, inpainted: 4 }[
-      store.stage
-    ] ?? 0
-  )
-)
+// 自动入队模式（方案 v1.2）：下载与去水印点击即入队，无等待页。
+// stage 合法值收敛为 idle / downloaded / inpainted。
+const steps = ['输入链接', '框选去水印', '结果导出']
+const stepIdx = computed(() => ({ idle: 0, downloaded: 1, inpainted: 2 }[store.stage] ?? 0))
 
 const previewItem = computed(() => {
   if (store.previewPath) {
@@ -48,14 +41,8 @@ const previewItem = computed(() => {
 })
 const previewSrc = computed(() => previewItem.value?.thumb || '')
 
-const pct = computed(() =>
-  store.progress.total
-    ? Math.round((store.progress.index / store.progress.total) * 100)
-    : 0
-)
-
-// AI 引擎未就绪（starting/error）期间禁用去水印按钮
-const engineReady = computed(() => store.engineStatus === 'ready')
+// 引擎 error 态拦截入队（starting 态允许排队，队列即等待）
+const engineError = computed(() => store.engineStatus === 'error')
 
 const urlRef = ref(null)
 const showNotice = ref(false)
@@ -109,11 +96,10 @@ async function clearCookie() {
   }
 }
 
-// ---------------- 任务队列（PRD §2.2 入口二） ----------------
+// ---------------- 任务队列面板 ----------------
 // 面板展示队列任务列表；数据由 queue:updated 事件全量同步，
 // 打开时主动拉取一次快照（弥补订阅前错过的事件）。
 const showQueue = ref(false)
-const queueInput = ref('')
 
 async function openQueue() {
   showQueue.value = true
@@ -125,29 +111,13 @@ const queueActive = computed(
   () => store.queue.filter((t) => ['pending', 'running', 'retry_wait'].includes(t.state)).length
 )
 
-// 两类队列独立展示与管理（问题修复 #1）：下载与去水印分组，各自的清空/列表互不干扰
+// 两类队列独立展示与管理：下载与去水印分组，各自的清空/列表互不干扰
 const downloadTasks = computed(() => store.queue.filter((t) => t.type === 'download'))
 const inpaintTasks = computed(() => store.queue.filter((t) => t.type === 'inpaint'))
 const queueSections = computed(() => [
   { key: 'download', title: '⬇ 下载任务', tasks: downloadTasks.value },
   { key: 'inpaint', title: '🖼 去水印任务', tasks: inpaintTasks.value },
 ])
-
-// 第四步（处理中页）：本页任务的排队状态提示（问题修复 #3 的等待可感知性）
-const pageTask = computed(() => store.queue.find((t) => t.id === store.pageTaskId) || null)
-const queuedAhead = computed(() => {
-  if (!pageTask.value || pageTask.value.state !== 'pending') return 0
-  const idx = store.queue.findIndex((t) => t.id === pageTask.value.id)
-  return store.queue.filter(
-    (t, j) => j < idx && ['pending', 'running', 'retry_wait'].includes(t.state)
-  ).length
-})
-
-function batchAdd() {
-  if (!queueInput.value.trim()) return
-  addQueueTasks(queueInput.value)
-  queueInput.value = ''
-}
 
 // 队列任务状态/类型的展示元数据
 const stateMeta = {
@@ -348,12 +318,53 @@ watch(
     if (s !== 'downloaded') stopAudition(false)
   }
 )
-onBeforeUnmount(() => stopAudition(true))
+onBeforeUnmount(() => {
+  stopAudition(true)
+  window.removeEventListener('focus', onWindowFocus)
+})
 
 function go() {
-  if (store.running) return
   startDownload()
 }
+
+// ---------------- 剪贴板自动读取链接 ----------------
+// 窗口聚焦 / 回到首页时自动探测剪贴板：若含社媒图文链接且输入框为空则自动填入。
+// WebView2 下 readText 可能因权限被拒——静默失败不提示；「📋」按钮作为用户手势
+// 兜底（手势触发时权限通过率高）。
+const SOCIAL_LINK_RE = /(douyin|iesdouyin|xiaohongshu|xhslink|mp\.weixin\.qq\.com)/i
+const URL_RE = /https?:\/\/[^\s"'<>，。；、）】]+/i
+let lastClipLink = ''
+
+async function readClipboardLink(force = false) {
+  if (store.stage !== 'idle') return
+  let text = ''
+  try {
+    text = await navigator.clipboard.readText()
+  } catch {
+    return // 权限拒绝 / 非安全上下文：静默
+  }
+  const m = String(text || '').match(URL_RE)
+  if (!m || !SOCIAL_LINK_RE.test(m[0])) return
+  const link = m[0]
+  const isNew = link !== lastClipLink
+  lastClipLink = link
+  if (!force && store.inputUrl.trim()) return // 已有输入不覆盖
+  store.inputUrl = link
+  if (isNew || force) {
+    showToast('已从剪贴板读取链接，点「下载图片」加入队列', 'info')
+  }
+}
+
+function onWindowFocus() {
+  readClipboardLink(false)
+}
+
+watch(
+  () => store.stage,
+  (s) => {
+    if (s === 'idle') readClipboardLink(false)
+  }
+)
 
 function backToAdjust() {
   store.stage = 'downloaded'
@@ -384,8 +395,10 @@ onMounted(() => {
       appVersion.value = v || ''
     })
     .catch(() => {})
-  showToast('支持公众号文章 / 小红书图文 / 抖音图文链接', 'info')
+  showToast('支持公众号 / 小红书 / 抖音图文；下载与去水印将自动加入任务队列', 'info')
   window.addEventListener('keydown', onKey)
+  window.addEventListener('focus', onWindowFocus)
+  readClipboardLink(false) // 首次进入探测一次剪贴板
 })
 
 function onKey(e) {
@@ -454,20 +467,10 @@ function onKey(e) {
                 placeholder="https://www.xiaohongshu.com/explore/… 或 https://mp.weixin.qq.com/s/…"
                 @keyup.enter="go"
               />
-              <button class="btn btn-primary" :disabled="store.running || !store.inputUrl.trim()" @click="go">
+              <button class="btn" title="从剪贴板读取链接" @click="readClipboardLink(true)">📋</button>
+              <button class="btn btn-primary" :disabled="!store.inputUrl.trim()" @click="go">
                 下载图片
               </button>
-            </div>
-            <!-- 批量入队（PRD §2.2 入口一）：每行一条链接，逐条预检平台后入队 -->
-            <div class="queue-row">
-              <textarea
-                v-model="queueInput"
-                class="input queue-textarea"
-                rows="3"
-                placeholder="批量模式：每行粘贴一个链接（可混合公众号 / 小红书 / 抖音图文），加入队列后台依次下载"
-                spellcheck="false"
-              ></textarea>
-              <button class="btn" :disabled="!queueInput.trim()" @click="batchAdd">🗂 批量解析并加入队列</button>
             </div>
             <div class="local-row">
               <span class="local-divider"></span>
@@ -475,13 +478,13 @@ function onKey(e) {
               <span class="local-divider"></span>
             </div>
             <div class="local-row">
-              <button class="btn" :disabled="store.running" @click="loadLocalFolder">
+              <button class="btn" @click="loadLocalFolder">
                 📁 选择本地文件夹
               </button>
               <span class="local-tip">直接识别并去水印本机图片，无需下载</span>
             </div>
             <div class="local-row">
-              <button class="btn cookie-btn" :disabled="store.running" @click="openCookie">
+              <button class="btn cookie-btn" @click="openCookie">
                 🍪 抖音 Cookie 设置
               </button>
               <span class="local-tip">抖音链接下载失败（风控）时配置，可提高成功率</span>
@@ -491,17 +494,7 @@ function onKey(e) {
               <span class="chip">小红书图文</span>
               <span class="chip">抖音图文</span>
             </div>
-          </div>
-        </section>
-      </transition>
-
-      <!-- 步骤2：下载中 -->
-      <transition name="stage">
-        <section v-if="store.stage === 'downloading'" class="stage-view center" key="downloading">
-          <div class="card progress-card">
-            <div class="spinner"></div>
-            <h2 class="h-title">正在下载图片…</h2>
-            <p class="h-sub">已识别平台并开始抓取，请稍候</p>
+            <p class="auto-queue-tip">下载与去水印均自动加入任务队列后台执行，点击顶栏「任务队列」查看进度与结果</p>
           </div>
         </section>
       </transition>
@@ -550,35 +543,26 @@ function onKey(e) {
                 <div class="opt-row btns">
                   <button
                     class="btn btn-primary"
-                    :disabled="store.running || !store.boxes.length || !engineReady"
+                    :disabled="!store.boxes.length || engineError"
                     @click="startBatch(true)"
+                    title="加入任务队列后台执行，完成后可在任务队列面板查看结果"
                   >
                     全部去水印
                   </button>
                   <button
                     class="btn"
-                    :disabled="store.selected.length === 0 || !store.boxes.length || !engineReady"
+                    :disabled="store.selected.length === 0 || !store.boxes.length || engineError"
                     @click="startBatch(false)"
                   >
                     仅勾选({{ store.selected.length }})
                   </button>
-                  <button
-                    class="btn"
-                    :disabled="!store.boxes.length || !engineReady"
-                    @click="enqueueInpaint(store.selected.length === 0)"
-                    title="固化当前框选参数，加入任务队列后台执行（不打断当前页面）"
-                  >
-                    + 加入队列
-                  </button>
-                  <button class="btn btn-danger" :disabled="!store.running" @click="cancelBatch">取消</button>
-                  <button class="btn" :disabled="store.running" @click="exportSourceZip" title="把未去水印的原图打包为 zip 导出">
+                  <button class="btn" @click="exportSourceZip" title="把未去水印的原图打包为 zip 导出">
                     ⬇ 源图打包
                   </button>
                   <button
                     v-if="hasBGM"
                     class="btn"
                     :class="{ 'bgm-done': !!store.bgmSaved }"
-                    :disabled="store.running"
                     @click="openBGM"
                     :title="store.post.audioName ? `曲目：${store.post.audioName}（可单独下载，也可放入源图 zip）` : '下载该图文的背景音乐'"
                   >
@@ -589,7 +573,7 @@ function onKey(e) {
                 <div v-if="hasBGM" class="bgm-player">
                   <button
                     class="play-btn"
-                    :disabled="store.running || bgmPlayer.loading"
+                    :disabled="bgmPlayer.loading"
                     :title="bgmPlayer.playing ? '暂停试听' : '试听背景音乐'"
                     @click="toggleAudition"
                   >
@@ -612,9 +596,11 @@ function onKey(e) {
                   <span v-if="bgmPlayer.error" class="player-err">{{ bgmPlayer.error }}</span>
                 </div>
                 <p class="tip">可拖拽框选多个水印区域；框内按住拖动可整体移动，框边贴到图像边缘会自动吸附对齐；点区域 ✕ 删除单个，点「清空」全部删除。</p>
-                <p v-if="!engineReady" class="tip engine-status">
-                  {{ store.engineStatus === 'error' ? '⚠️' : '⏳' }}
-                  {{ store.engineMessage || 'AI 引擎启动中…' }}
+                <p v-if="engineError" class="tip engine-status">
+                  ⚠️ {{ store.engineMessage || 'AI 引擎启动失败，请重启应用' }}
+                </p>
+                <p v-else-if="store.engineStatus === 'starting'" class="tip engine-status">
+                  ⏳ {{ store.engineMessage || 'AI 引擎启动中…（已入队的去水印任务会在就绪后自动执行）' }}
                 </p>
               </div>
               <div class="log">
@@ -635,25 +621,6 @@ function onKey(e) {
               @range="onRange"
               @deselect-all="onDeselectAll"
             />
-          </div>
-        </section>
-      </transition>
-
-      <!-- 步骤4：处理中 -->
-      <transition name="stage">
-        <section v-if="store.stage === 'inpainting'" class="stage-view center" key="inpainting">
-          <div class="card progress-card">
-            <div class="spinner"></div>
-            <h2 class="h-title">LaMa 正在修复…</h2>
-            <p v-if="pageTask && pageTask.state === 'pending'" class="h-sub">
-              当前任务排队中，前方还有 {{ queuedAhead }} 个任务，完成后自动开始…
-            </p>
-            <p v-else class="h-sub">
-              {{ store.progress.index }}/{{ store.progress.total }} · {{ store.progress.name }}
-            </p>
-            <div class="progress wide">
-              <div class="bar" :style="{ width: pct + '%' }"></div>
-            </div>
           </div>
         </section>
       </transition>
@@ -877,7 +844,7 @@ function onKey(e) {
             <div v-if="!store.queue.length" class="queue-empty">
               <div class="qe-icon">🗂</div>
               <p>队列为空</p>
-              <p class="qe-tip">可在首页批量粘贴链接加入下载队列，<br>或在框选页点「+ 加入队列」后台执行去水印</p>
+              <p class="qe-tip">在首页粘贴链接点「下载图片」即自动入队；<br>框选后点「全部去水印」自动后台执行</p>
             </div>
             <template v-else>
               <div v-for="sec in queueSections" :key="sec.key" class="queue-section">
@@ -1041,16 +1008,11 @@ function onKey(e) {
   line-height: 1;
 }
 
-/* 首页批量链接入口 */
-.queue-row { display: flex; gap: 10px; margin-top: 12px; align-items: stretch; }
-.queue-textarea {
-  flex: 1;
-  resize: vertical;
-  min-height: 64px;
-  font-size: 12px;
-  line-height: 1.6;
-  font-family: inherit;
-  word-break: break-all;
+/* 首页自动入队提示 */
+.auto-queue-tip {
+  margin-top: 16px;
+  font-size: 11.5px;
+  color: var(--text-3);
 }
 
 /* 队列弹窗：左右双列（下载 | 去水印），窄窗口回退上下堆叠 */

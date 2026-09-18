@@ -9,12 +9,12 @@
 
 ## 下载安装
 
-当前版本：**1.1.8**
+当前版本：**1.1.9**
 
 | 平台 | 安装包 | 安装方式 |
 |---|---|---|
-| Windows 10/11 (x64) | `社媒图文水印抹除工具_Setup_1.1.8.exe`（约 300MB，经 Git LFS 分发） | 双击安装，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限；中文界面，可自定义安装目录；含卸载入口 |
-| macOS (Apple Silicon) | `社媒图文水印抹除工具_1.1.8_arm64.dmg` | 打开镜像，把应用拖入「应用程序」。应用为 ad-hoc 签名（未公证），首次打开需右键 →「打开」放行，详见镜像内《首次打开说明.txt》 |
+| Windows 10/11 (x64) | `社媒图文水印抹除工具_Setup_1.1.9.exe`（约 300MB，经 Git LFS 分发） | 双击安装，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限；中文界面，可自定义安装目录；含卸载入口 |
+| macOS (Apple Silicon) | `社媒图文水印抹除工具_1.1.9_arm64.dmg` | 打开镜像，把应用拖入「应用程序」。应用为 ad-hoc 签名（未公证），首次打开需右键 →「打开」放行，详见镜像内《首次打开说明.txt》 |
 
 - 两个安装包都已内置 big-lama 权重与完整推理引擎，**无需额外下载模型**
 - 兼容非 ASCII 安装路径；卸载/退出时自动回收引擎子进程
@@ -151,7 +151,7 @@ wails build -platform windows/amd64 -webview2 embed
 
 ```bat
 :: 先完成上述引擎与主程序编译，并确认 build/bin/ 下已就位主 exe 与 lamacore\ 目录
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.8 packaging\installer.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.9 packaging\installer.iss
 :: 产物：build\installer\社媒图文水印抹除工具_Setup_<版本>.exe
 ```
 
@@ -163,7 +163,7 @@ wails build -platform windows/amd64 -webview2 embed
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
-# 可选：-SkipEngine（复用已有引擎，省几十分钟） -SkipApp（只重打安装器） -Version 1.1.8
+# 可选：-SkipEngine（复用已有引擎，省几十分钟） -SkipApp（只重打安装器） -Version 1.1.9
 ```
 
 版本号单一来源：`wails.json` 的 `productVersion`（macOS 的 `CFBundleShortVersionString`

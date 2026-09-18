@@ -170,7 +170,7 @@ watch(
         @contextmenu="onTileContext($event, img.path)"
       >
         <img v-if="img.thumb" :src="img.thumb" :alt="img.name" loading="lazy" draggable="false" />
-        <div v-else class="ph" :title="img.name">无法预览</div>
+        <div v-else class="ph" :title="img.name">{{ img.loading ? '加载中…' : '无法预览' }}</div>
         <button
           v-if="selectable"
           class="check"

@@ -3,7 +3,9 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,20 +96,183 @@ func useFastBackoff(t *testing.T) {
 	t.Cleanup(func() { RetryBackoffs = old })
 }
 
-// TestDownloadPriority download 优先于 inpaint（PRD §3.2）。
-func TestDownloadPriority(t *testing.T) {
+// TestCrossTypeParallel download 与 inpaint 并行执行（方案 O3 核心断言）：
+// inpaint 阻塞运行时，download 照常被执行。
+func TestCrossTypeParallel(t *testing.T) {
 	exec := newFakeExecutor()
+	block := make(chan struct{})
+	exec.ipFn = func(ctx context.Context, t *BatchTask) (InpaintResult, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return InpaintResult{}, ctx.Err()
+	}
+	q := newTestQueue(exec)
+	defer func() {
+		close(block)
+		q.Stop()
+	}()
+
+	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/slow", OutDir: "/slow_out"})
+	<-exec.started // inpaint 开始阻塞
+
+	// download 任务在 inpaint 阻塞期间应被另一个 worker 立即执行
+	q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/fast"})
+	select {
+	case <-exec.started:
+		// 已被调度执行
+	case <-time.After(2 * time.Second):
+		t.Fatal("inpaint 阻塞期间 download 未被执行——双 worker 并行失效")
+	}
+	dl, ip := exec.calls()
+	if dl != 1 || ip != 1 {
+		t.Fatalf("dl=%d ip=%d", dl, ip)
+	}
+}
+
+// TestSameTypeSerial 同类任务仍串行：inpaint A 阻塞期间 B 不启动。
+func TestSameTypeSerial(t *testing.T) {
+	exec := newFakeExecutor()
+	block := make(chan struct{})
+	exec.ipFn = func(ctx context.Context, t *BatchTask) (InpaintResult, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return InpaintResult{}, ctx.Err()
+	}
+	q := newTestQueue(exec)
+	defer func() {
+		close(block)
+		q.Stop()
+	}()
+
+	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/a", OutDir: "/a_out"})
+	<-exec.started
+	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/b", OutDir: "/b_out"})
+	time.Sleep(100 * time.Millisecond)
+	for _, c := range exec.ipCalls {
+		if c == "/b" {
+			t.Error("同类任务不应并行：A 运行中 B 已启动")
+		}
+	}
+}
+
+// TestQueueCap 每类队列活跃上限 10 条（方案 O4）。
+func TestQueueCap(t *testing.T) {
+	exec := newFakeExecutor()
+	block := make(chan struct{})
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (string, string, []string, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return "", "", nil, ctx.Err()
+	}
+	q := newTestQueue(exec)
+	defer func() {
+		close(block)
+		q.Stop()
+	}()
+
+	// 首条进入 running，其余 9 条 pending → 10 条活跃
+	for i := 0; i < MaxActivePerQueue; i++ {
+		if _, err := q.Enqueue(&BatchTask{Type: TypeDownload, URL: fmt.Sprintf("https://x/%d", i)}); err != nil {
+			t.Fatalf("第 %d 条不应被拒: %v", i+1, err)
+		}
+	}
+	if _, err := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/over"}); err == nil {
+		t.Error("第 11 条应被拒（下载队列已满）")
+	} else if !strings.Contains(err.Error(), "下载队列已满") {
+		t.Errorf("错误文案不符: %v", err)
+	}
+	// inpaint 队列独立计数，不受下载队列占满影响
+	if _, err := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/a", OutDir: "/a_out"}); err != nil {
+		t.Errorf("inpaint 队列应独立计数: %v", err)
+	}
+}
+
+// TestRetryCap 重试同样受活跃上限约束；终态任务不计活跃。
+// 构造：1 条永久失败（终态）+ 10 条阻塞活跃 → 重试被拒；
+// 取消 1 条活跃后 → 重试放行。
+func TestRetryCap(t *testing.T) {
+	exec := newFakeExecutor()
+	block := make(chan struct{})
+	exec.ipFn = func(ctx context.Context, t *BatchTask) (InpaintResult, error) {
+		if t.InDir == "/doomed" {
+			return InpaintResult{}, Permanent(errors.New("doomed"))
+		}
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return InpaintResult{}, ctx.Err()
+	}
+	q := newTestQueue(exec)
+	defer func() {
+		close(block)
+		q.Stop()
+	}()
+
+	doomed, _ := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/doomed", OutDir: "/doomed_out"})
+	waitFor(t, func() bool { return taskState(q, doomed.ID) == StateFailed }, "永久失败任务应到 failed")
+
+	// 填满 10 条活跃
+	for i := 0; i < MaxActivePerQueue; i++ {
+		tk, err := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: fmt.Sprintf("/b%d", i), OutDir: fmt.Sprintf("/b%d_out", i)})
+		if err != nil {
+			t.Fatalf("第 %d 条不应被拒: %v", i+1, err)
+		}
+		_ = tk
+	}
+	// 活跃已满：重试终态任务应被拒
+	if err := q.Retry(doomed.ID); err == nil {
+		t.Error("队列满载时重试应被拒绝")
+	}
+	// 取消一条活跃 → 腾出名额 → 重试放行
+	var oneActive string
+	for _, s := range q.Snapshot() {
+		if s.State == StatePending && s.InDir == "/b9" {
+			oneActive = s.ID
+		}
+	}
+	if oneActive != "" {
+		if err := q.Cancel(oneActive); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Retry(doomed.ID); err != nil {
+		t.Fatalf("腾出名额后重试应放行: %v", err)
+	}
+	// 重试已入队（worker 被阻塞任务占住，不必等其执行完成）
+	waitFor(t, func() bool { return taskState(q, doomed.ID) == StatePending }, "重试后应回到 pending")
+}
+
+// TestCancelRunningByType CancelRunning 按类型定向取消，互不影响。
+func TestCancelRunningByType(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.ipFn = func(ctx context.Context, t *BatchTask) (InpaintResult, error) {
+		select {
+		case <-time.After(10 * time.Second):
+		case <-ctx.Done():
+		}
+		return InpaintResult{}, ctx.Err()
+	}
 	q := newTestQueue(exec)
 	defer q.Stop()
 
-	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/in1", OutDir: "/in1_out"})
-	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/in2", OutDir: "/in2_out"})
-	q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/a"})
-
-	waitFor(t, func() bool { dl, ip := exec.calls(); return dl == 1 && ip == 2 }, "任务未全部执行")
-	if exec.dlCalls[0] != "https://x/a" {
-		t.Errorf("download 应最先执行，实际顺序 dl=%v ip=%v", exec.dlCalls, exec.ipCalls)
+	ip, _ := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/a", OutDir: "/a_out"})
+	<-exec.started
+	// 取消 download 类型（无运行中）→ 不影响 inpaint
+	q.CancelRunning(TypeDownload)
+	time.Sleep(50 * time.Millisecond)
+	if got := taskState(q, ip.ID); got != StateRunning {
+		t.Errorf("CancelRunning(download) 不应影响 inpaint，实际 %s", got)
 	}
+	// 取消 inpaint 类型 → 生效
+	q.CancelRunning(TypeInpaint)
+	waitFor(t, func() bool { return taskState(q, ip.ID) == StateCanceled }, "定向取消未生效")
 }
 
 // TestSuccessDone 成功路径：done + 结果回填；部分单张失败不算任务失败（PRD §5.2）。

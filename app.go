@@ -683,12 +683,12 @@ func (a *App) EnqueueInpaint(inDir, outDir string, p TaskParams, title string) (
 	return a.StartBatch(inDir, outDir, p, title)
 }
 
-// CancelBatch 取消当前正在执行的批次任务：先取消任务 ctx（阻止后续图片继续
+// CancelBatch 取消当前正在执行的去水印任务：先取消任务 ctx（阻止后续图片继续
 // 推理/落盘），再立即终止引擎进程树以中断进行中的推理请求；引擎在下次使用时
-// 懒重启。无运行任务时为空操作（保持旧语义：仅一个批次可能处于执行中）。
+// 懒重启。无运行任务时为空操作（下载任务的取消由队列面板按 ID 进行）。
 func (a *App) CancelBatch() error {
 	if a.q != nil {
-		a.q.CancelRunning()
+		a.q.CancelRunning(queue.TypeInpaint)
 	}
 	a.engineMu.Lock()
 	e := a.engine

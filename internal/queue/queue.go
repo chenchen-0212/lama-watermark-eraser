@@ -1,9 +1,12 @@
-// Package queue 提供批处理任务队列：任务模型、串行调度器、失败重试与持久化。
+// Package queue 提供批处理任务队列：任务模型、调度器、失败重试与持久化。
 //
-// 设计要点（对应《批处理任务功能_产品说明文档》）：
+// 设计要点（对应《自动入队产品优化方案》v1.2）：
 //   - 两类任务：download（社媒链接下载）/ inpaint（去水印，入队时固化参数）；
-//   - 单 worker 串行执行，download 优先于 inpaint（下载快且不占引擎，先清积压）；
-//     与引擎单实例、App 层互斥约束天然一致；
+//   - **双 worker 并行**：download 与 inpaint 各一个 worker，两类之间互不阻塞
+//     （网络 I/O 与引擎 CPU 资源不冲突）；同类任务仍串行——引擎单实例红线
+//     只约束 inpaint 之间，下载目录互斥由 App 层 downloadMu 保护；
+//   - 每类队列活跃任务（pending+running+retry_wait）上限 MaxActivePerQueue 条，
+//     超出拒绝入队（防堆积）；
 //   - 失败三分类：瞬时错误指数退避自动重试 ≤MaxAutoRetries 次；确定性错误
 //     （Permanent 包装）不重试直接 failed；取消不计失败；
 //   - 任务列表原子持久化到 queue.json，应用重启后 running/retry_wait 降级为
@@ -46,6 +49,10 @@ const (
 
 // MaxAutoRetries 瞬时错误自动重试上限（不含首次执行，即最多执行 1+3=4 次）。
 const MaxAutoRetries = 3
+
+// MaxActivePerQueue 每类队列的活跃任务上限（pending+running+retry_wait），
+// 超出拒绝入队/重试（防连续提交堆积，方案 O4）。
+const MaxActivePerQueue = 10
 
 // RetryBackoffs 自动重试指数退避间隔（按第 n 次重试取下标，越界取末项）。
 var RetryBackoffs = []time.Duration{10 * time.Second, time.Minute, 5 * time.Minute}
@@ -168,7 +175,7 @@ type Notifier func(event string, payload interface{})
 
 // ---------------------------------------------------------- 队列
 
-// Queue 批处理任务队列（单 worker 串行调度）。
+// Queue 批处理任务队列（download / inpaint 双 worker 并行，同类串行）。
 type Queue struct {
 	mu     sync.Mutex
 	tasks  []*BatchTask
@@ -179,9 +186,11 @@ type Queue struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	wake   chan struct{} // 容量 1：有 pending 任务 / 状态变化时唤醒 worker
+	wakeD  chan struct{} // 容量 1：唤醒 download worker
+	wakeI  chan struct{} // 容量 1：唤醒 inpaint worker
 
-	runningID   string                        // 当前 running 任务 ID（空=空闲）
+	runningD    string                        // 当前 running 的 download 任务 ID（空=空闲）
+	runningI    string                        // 当前 running 的 inpaint 任务 ID（空=空闲）
 	taskCancels map[string]context.CancelFunc // 运行中任务的 ctx 取消函数
 	retryTimer  map[string]*time.Timer        // retry_wait 任务的退避定时器
 	onCancel    func(*BatchTask)              // 运行中任务被取消时的回调（App 层终止引擎）
@@ -193,7 +202,8 @@ func New(exec Executor, notify Notifier, path string) *Queue {
 		exec:        exec,
 		notify:      notify,
 		path:        path,
-		wake:        make(chan struct{}, 1),
+		wakeD:       make(chan struct{}, 1),
+		wakeI:       make(chan struct{}, 1),
 		taskCancels: make(map[string]context.CancelFunc),
 		retryTimer:  make(map[string]*time.Timer),
 	}
@@ -203,8 +213,9 @@ func New(exec Executor, notify Notifier, path string) *Queue {
 // 进行中的推理——与旧 CancelBatch 的 Kill 双保险语义一致）。
 func (q *Queue) SetOnCancel(fn func(t *BatchTask)) { q.onCancel = fn }
 
-// Start 启动调度：加载持久化任务（running/retry_wait → pending）并拉起 worker。
-// ctx 取消（应用退出）后 worker 退出，队列状态已持久化。
+// Start 启动调度：加载持久化任务（running/retry_wait → pending）并拉起
+// download / inpaint 两个 worker。ctx 取消（应用退出）后 worker 退出，
+// 队列状态已持久化。
 func (q *Queue) Start(ctx context.Context) {
 	if tasks, err := LoadQueue(q.path); err == nil {
 		q.mu.Lock()
@@ -214,10 +225,12 @@ func (q *Queue) Start(ctx context.Context) {
 		q.save()
 	}
 	q.ctx, q.cancel = context.WithCancel(ctx)
-	q.wg.Add(1)
-	go q.worker()
+	q.wg.Add(2)
+	go q.workerLoop(TypeDownload, q.wakeD)
+	go q.workerLoop(TypeInpaint, q.wakeI)
 	q.notifyUpdate() // 前端启动时同步一次队列快照
-	q.kick()
+	q.kickD()
+	q.kickI()
 }
 
 // Stop 停止调度并等待 worker 退出（应用 shutdown 时调用）。
@@ -242,6 +255,21 @@ func (q *Queue) recoverLocked() {
 	}
 }
 
+// activeCountLocked 统计某类型的活跃任务数（pending+running+retry_wait；
+// excludeID 用于 Retry 场景排除自身——终态任务本就不计活跃）。
+func (q *Queue) activeCountLocked(taskType, excludeID string) int {
+	n := 0
+	for _, t := range q.tasks {
+		if t.Type != taskType || t.ID == excludeID {
+			continue
+		}
+		if !terminalState(t.State) {
+			n++
+		}
+	}
+	return n
+}
+
 // Enqueue 追加任务入队（默认 pending）。task.ID 由本方法生成。
 func (q *Queue) Enqueue(t *BatchTask) (*BatchTask, error) {
 	if t == nil {
@@ -251,6 +279,11 @@ func (q *Queue) Enqueue(t *BatchTask) (*BatchTask, error) {
 		return nil, fmt.Errorf("未知任务类型: %s", t.Type)
 	}
 	q.mu.Lock()
+	// 容量上限：每类队列活跃任务数封顶（方案 O4，防连续提交堆积）
+	if n := q.activeCountLocked(t.Type, ""); n >= MaxActivePerQueue {
+		q.mu.Unlock()
+		return nil, fmt.Errorf("%s队列已满（上限 %d 条），请先处理或清理现有任务", taskTypeName(t.Type), MaxActivePerQueue)
+	}
 	t.ID = newID()
 	t.State = StatePending
 	t.Attempts = 0
@@ -284,11 +317,12 @@ func (q *Queue) Enqueue(t *BatchTask) (*BatchTask, error) {
 	q.mu.Unlock()
 	q.save()
 	q.notifyUpdate()
-	q.kick()
+	q.kickByType(t.Type)
 	return t, nil
 }
 
 // Retry 手动重试：failed/canceled → pending，重试计数清零，按 FIFO 重新排队。
+// 重试同样受每队列活跃上限约束（方案 O4）。
 func (q *Queue) Retry(id string) error {
 	q.mu.Lock()
 	t := q.byIDLocked(id)
@@ -300,6 +334,12 @@ func (q *Queue) Retry(id string) error {
 		q.mu.Unlock()
 		return fmt.Errorf("该任务未在终态，无法重试")
 	}
+	// 终态任务不计活跃，转 pending 后自身即占 1 个名额
+	if n := q.activeCountLocked(t.Type, t.ID); n >= MaxActivePerQueue {
+		typeName := taskTypeName(t.Type)
+		q.mu.Unlock()
+		return fmt.Errorf("%s队列已满（上限 %d 条），请先处理或清理现有任务再重试", typeName, MaxActivePerQueue)
+	}
 	t.State = StatePending
 	t.Attempts = 0
 	t.Err = ""
@@ -309,7 +349,7 @@ func (q *Queue) Retry(id string) error {
 	q.mu.Unlock()
 	q.save()
 	q.notifyUpdate()
-	q.kick()
+	q.kickByType(t.Type)
 	return nil
 }
 
@@ -354,11 +394,17 @@ func (q *Queue) Cancel(id string) error {
 	}
 }
 
-// CancelRunning 取消当前正在执行的任务（对齐旧 CancelBatch「取消当前批次」语义；
-// 同一时刻至多一个任务在执行）。无运行任务时为空操作。
-func (q *Queue) CancelRunning() {
+// CancelRunning 取消指定类型的运行中任务（taskType=TypeDownload/TypeInpaint）。
+// CancelBatch 用 TypeInpaint 对齐旧「取消当前批次」语义；无运行任务时为空操作。
+func (q *Queue) CancelRunning(taskType string) {
 	q.mu.Lock()
-	id := q.runningID
+	var id string
+	switch taskType {
+	case TypeDownload:
+		id = q.runningD
+	case TypeInpaint:
+		id = q.runningI
+	}
 	q.mu.Unlock()
 	if id != "" {
 		_ = q.Cancel(id)
@@ -448,12 +494,36 @@ func (q *Queue) byIDLocked(id string) *BatchTask {
 	return nil
 }
 
-// kick 唤醒 worker（非阻塞，容量 1 合并多次唤醒）。
-func (q *Queue) kick() {
+// taskTypeName 任务类型的中文展示名（容量错误文案用）。
+func taskTypeName(t string) string {
+	if t == TypeInpaint {
+		return "去水印"
+	}
+	return "下载"
+}
+
+// kickD / kickI 唤醒对应 worker（非阻塞，容量 1 合并多次唤醒）。
+func (q *Queue) kickD() {
 	select {
-	case q.wake <- struct{}{}:
+	case q.wakeD <- struct{}{}:
 	default:
 	}
+}
+
+func (q *Queue) kickI() {
+	select {
+	case q.wakeI <- struct{}{}:
+	default:
+	}
+}
+
+// kickByType 按任务类型唤醒对应 worker。
+func (q *Queue) kickByType(taskType string) {
+	if taskType == TypeInpaint {
+		q.kickI()
+		return
+	}
+	q.kickD()
 }
 
 // notifyUpdate 广播全量快照（队列规模小，免增量合并复杂度，PRD §4.3）。
@@ -464,40 +534,33 @@ func (q *Queue) notifyUpdate() {
 	q.notify("queue:updated", map[string]interface{}{"tasks": q.Snapshot()})
 }
 
-// nextPending 取下一个待执行任务：FIFO 基础上 download 优先于 inpaint
-// （先清下载积压让用户尽早框选；inpaint 慢，放后面减少阻塞，PRD §3.2）。
-func (q *Queue) nextPending() *BatchTask {
+// nextPendingByType 取该类型队列中最早的 pending 任务（FIFO）。
+func (q *Queue) nextPendingByType(taskType string) *BatchTask {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	var firstInpaint *BatchTask
 	for _, t := range q.tasks {
-		if t.State != StatePending {
-			continue
-		}
-		if t.Type == TypeDownload {
+		if t.Type == taskType && t.State == StatePending {
 			return t
 		}
-		if firstInpaint == nil {
-			firstInpaint = t
-		}
 	}
-	return firstInpaint
+	return nil
 }
 
-// worker 调度主循环：唤醒后持续取 pending 任务执行，直到无任务或 ctx 取消。
-func (q *Queue) worker() {
+// workerLoop 调度主循环（每类型一个）：唤醒后持续取本类型 pending 任务执行，
+// 直到无任务或 ctx 取消。同类任务串行、跨类并行。
+func (q *Queue) workerLoop(taskType string, wake chan struct{}) {
 	defer q.wg.Done()
 	for {
 		select {
 		case <-q.ctx.Done():
 			return
-		case <-q.wake:
+		case <-wake:
 		}
 		for {
 			if q.ctx.Err() != nil {
 				return
 			}
-			t := q.nextPending()
+			t := q.nextPendingByType(taskType)
 			if t == nil {
 				break
 			}
@@ -517,7 +580,11 @@ func (q *Queue) execute(t *BatchTask) {
 	now := time.Now()
 	t.StartedAt = &now
 	t.FinishedAt = nil
-	q.runningID = t.ID
+	if t.Type == TypeInpaint {
+		q.runningI = t.ID
+	} else {
+		q.runningD = t.ID
+	}
 	q.taskCancels[t.ID] = cancel
 	q.mu.Unlock()
 	q.save()
@@ -557,8 +624,11 @@ func (q *Queue) execute(t *BatchTask) {
 
 	q.mu.Lock()
 	delete(q.taskCancels, t.ID)
-	if q.runningID == t.ID {
-		q.runningID = ""
+	if t.Type == TypeInpaint && q.runningI == t.ID {
+		q.runningI = ""
+	}
+	if t.Type == TypeDownload && q.runningD == t.ID {
+		q.runningD = ""
 	}
 	t.Progress = nil
 	fin := time.Now()
@@ -643,10 +713,11 @@ func (q *Queue) retryDue(id string) {
 	t.State = StatePending
 	t.NextRetryAt = nil
 	delete(q.retryTimer, id)
+	taskType := t.Type
 	q.mu.Unlock()
 	q.save()
 	q.notifyUpdate()
-	q.kick()
+	q.kickByType(taskType)
 }
 
 // save 持久化（调用方须在状态变更后调用；内部自行加锁避免与读竞争）。
