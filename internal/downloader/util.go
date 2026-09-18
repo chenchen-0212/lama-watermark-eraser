@@ -24,6 +24,9 @@ func trimQuery(u string) string {
 	return u
 }
 
+// trimSpace 去首尾空白。
+func trimSpace(s string) string { return strings.TrimSpace(s) }
+
 // reservedWinNames Windows 保留设备名（做文件基名时不可用）。
 var reservedWinNames = map[string]bool{
 	"con": true, "prn": true, "aux": true, "nul": true,

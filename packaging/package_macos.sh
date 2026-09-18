@@ -4,6 +4,9 @@
 #
 # 前置：
 #   1) wails build -platform darwin/arm64   → build/bin/<App>.app
+#      ⚠ 构建时必须注入版本号，否则界面底部会显示 dev（见下方 VERSION 段落）：
+#        VERSION=$(grep -o '"productVersion": *"[^"]*"' wails.json | head -1 | cut -d'"' -f4)
+#        wails build -platform darwin/arm64 -ldflags "-s -w -X main.appVersion=$VERSION"
 #   2) bash python_engine/build_engine.sh   → python_engine/dist/lamacore/
 # 用法：
 #   bash packaging/package_macos.sh ["App 名称"]

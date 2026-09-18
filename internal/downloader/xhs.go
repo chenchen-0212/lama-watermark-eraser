@@ -76,6 +76,7 @@ func DownloadXHS(ctx context.Context, url, outDir string) (*Post, error) {
 	author := note.Get("user.nickname").String()
 
 	var imgURLs []string
+	seenImg := map[string]bool{}
 	for _, it := range note.Get("imageList").Array() {
 		u := it.Get("urlDefault").String()
 		if u == "" {
@@ -88,9 +89,12 @@ func DownloadXHS(ctx context.Context, url, outDir string) (*Post, error) {
 				}
 			}
 		}
-		if u != "" {
-			imgURLs = append(imgURLs, u)
+		// 去重：重复 URL 会落成 02d.ext 同内容文件，进框选页表现为图片重复
+		if u == "" || seenImg[u] {
+			continue
 		}
+		seenImg[u] = true
+		imgURLs = append(imgURLs, u)
 	}
 	if len(imgURLs) == 0 {
 		return nil, ErrNoImages

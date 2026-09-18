@@ -203,7 +203,7 @@ body {
 /* ============ Toast ============ */
 .toast {
   position: fixed;
-  top: 18px; left: 50%;
+  bottom: 64px; left: 50%;
   transform: translateX(-50%);
   padding: 10px 20px;
   border-radius: 12px;
@@ -213,12 +213,15 @@ body {
   background: var(--danger);
   box-shadow: var(--shadow-lg);
   z-index: 100;
+  /* 限宽换行：长错误信息不致横溢出屏 */
+  max-width: min(560px, 88vw);
+  text-align: center;
   animation: toast-in 0.45s var(--spring-bounce);
 }
 .toast.info { background: var(--accent); }
 .toast.ok { background: var(--ok); }
 @keyframes toast-in {
-  from { opacity: 0; transform: translate(-50%, -18px) scale(0.92); }
+  from { opacity: 0; transform: translate(-50%, 18px) scale(0.92); }
   to { opacity: 1; transform: translate(-50%, 0) scale(1); }
 }
 

@@ -9,12 +9,12 @@
 
 ## 下载安装
 
-当前版本：**1.1.3**
+当前版本：**1.1.8**
 
 | 平台 | 安装包 | 安装方式 |
 |---|---|---|
-| Windows 10/11 (x64) | `社媒图文水印抹除工具_Setup_1.1.3.exe`（约 300MB，经 Git LFS 分发） | 双击安装，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限；中文界面，可自定义安装目录；含卸载入口 |
-| macOS (Apple Silicon) | `社媒图文水印抹除工具_1.1.3_arm64.dmg` | 打开镜像，把应用拖入「应用程序」。应用为 ad-hoc 签名（未公证），首次打开需右键 →「打开」放行，详见镜像内《首次打开说明.txt》 |
+| Windows 10/11 (x64) | `社媒图文水印抹除工具_Setup_1.1.8.exe`（约 300MB，经 Git LFS 分发） | 双击安装，**按用户安装**（默认 `%LOCALAPPDATA%\Programs\LaMaWatermarkRemover`），无需管理员权限；中文界面，可自定义安装目录；含卸载入口 |
+| macOS (Apple Silicon) | `社媒图文水印抹除工具_1.1.8_arm64.dmg` | 打开镜像，把应用拖入「应用程序」。应用为 ad-hoc 签名（未公证），首次打开需右键 →「打开」放行，详见镜像内《首次打开说明.txt》 |
 
 - 两个安装包都已内置 big-lama 权重与完整推理引擎，**无需额外下载模型**
 - 兼容非 ASCII 安装路径；卸载/退出时自动回收引擎子进程
@@ -29,7 +29,10 @@
 - **引擎状态可视**：启动期自动预热并推送状态（starting/ready/error），未就绪时禁用消除按钮
 - **批量 / 勾选处理**：全部处理或仅处理勾选图片
 - **结果预览与导出**：左右滑动预览、点击放大，一键导出 zip 压缩包；第 2 步还支持「源图打包」导出去水印前的原图
+- **BGM 下载与试听**：自动识别小红书 / 抖音图文的背景音乐，可单独另存为独立文件，或存入源图目录随 zip 打包；第 3 步内嵌播放控件（播放/暂停、进度跳转、时间），优先播放已下载的本地 BGM 文件，未下载时按需抓取到本机试听缓存
+- **BGM 取源容错**：抖音音频按「候选链」逐个尝试（页面 `url_list` 全部地址 → 由 `music.id` 构造的确定性直链 → detail 接口兜底），单条 CDN 地址失效不再导致整体失败；落盘前校验响应体魔数，风控页 / 错误 JSON 会被拒绝而不会存成无法播放的假音频
 - **视频链接拦截**：自动识别视频链接并提示不支持（仅支持图文）
+- **版本信息可见**：界面底部作者签名处标注当前版本号（与安装包版本同源，构建时注入）；顶栏「注意事项」旁提供「更新明细」入口，弹窗内按版本列出更新内容，便于用户确认自己使用的版本与变更
 
 ## 工作流程
 
@@ -148,7 +151,7 @@ wails build -platform windows/amd64 -webview2 embed
 
 ```bat
 :: 先完成上述引擎与主程序编译，并确认 build/bin/ 下已就位主 exe 与 lamacore\ 目录
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.3 packaging\installer.iss
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.1.8 packaging\installer.iss
 :: 产物：build\installer\社媒图文水印抹除工具_Setup_<版本>.exe
 ```
 
@@ -160,7 +163,7 @@ wails build -platform windows/amd64 -webview2 embed
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
-# 可选：-SkipEngine（复用已有引擎，省几十分钟） -SkipApp（只重打安装器） -Version 1.1.3
+# 可选：-SkipEngine（复用已有引擎，省几十分钟） -SkipApp（只重打安装器） -Version 1.1.8
 ```
 
 版本号单一来源：`wails.json` 的 `productVersion`（macOS 的 `CFBundleShortVersionString`

@@ -20,6 +20,12 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+// appVersion 由构建时注入：wails build 的 -ldflags "-X main.appVersion=x.y.z"。
+// 打包脚本从 wails.json 的 productVersion 读取后传入，保证界面展示的版本号
+// 与安装包版本、exe 版本资源同源。未注入（如 go run 调试）时为空，
+// GetAppVersion 会回退为 "dev"。
+var appVersion string
+
 func main() {
 	// CLI 模式分流（带 --input 或 --url 时跳过 GUI）
 	if len(os.Args) > 1 {

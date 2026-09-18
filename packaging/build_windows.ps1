@@ -5,7 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 #
 # 可选参数：
-#   -Version 1.1.3    覆盖版本号（缺省读取 wails.json 的 productVersion）
+#   -Version 1.1.8    覆盖版本号（缺省读取 wails.json 的 productVersion）
 #   -SkipEngine       跳过 lamacore 引擎重建（已有 python_engine\dist\lamacore 时用，省几十分钟）
 #   -SkipApp          跳过主程序重建（只重打安装器）
 #
@@ -31,7 +31,10 @@ Write-Host "[INFO] 项目根目录: $root"
 
 # ---------- 版本号（唯一来源：wails.json）----------
 if (-not $Version) {
-  $Version = (Get-Content (Join-Path $root 'wails.json') -Raw | ConvertFrom-Json).productVersion
+  # 必须显式 -Encoding UTF8：wails.json 含中文且不带 BOM，Windows PowerShell 5.1
+  # 的 Get-Content 默认按 ANSI 解码，会把中文读成乱码导致 ConvertFrom-Json 报
+  # 「传入的对象无效」（乱码还会破坏引号配对）。
+  $Version = (Get-Content (Join-Path $root 'wails.json') -Raw -Encoding UTF8 | ConvertFrom-Json).productVersion
 }
 if (-not $Version) {
   throw "无法从 wails.json 读取 productVersion，可用 -Version x.y.z 指定"
@@ -89,7 +92,12 @@ if ($SkipApp) {
   Write-Host "[INFO] gcc: $($gcc.Source)"
 
   Write-Host "[INFO] 编译主程序（windows/amd64，WebView2 内嵌）..."
-  & wails build -platform windows/amd64 -webview2 embed
+  # -ldflags 注入版本号：让界面上展示的版本与安装包版本同源（app.GetAppVersion）。
+  # 不能用 `wails build -ldflags "-X main.appVersion=$Version"` 的引号写法——
+  # PowerShell 会把整串当单个参数传给 wails，Go 收到后无法解析。改用数组传参，
+  # PowerShell 会为含空格的元素自动补引号，语义与命令行一致。
+  $ldflags = "-s -w -X main.appVersion=$Version"
+  & wails build -platform windows/amd64 -webview2 embed -ldflags $ldflags
   if ($LASTEXITCODE -ne 0) { throw "wails build 失败（exit $LASTEXITCODE）" }
 }
 

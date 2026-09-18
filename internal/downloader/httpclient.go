@@ -1,7 +1,9 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,7 +53,11 @@ func platformFromURL(rawURL string) string {
 		strings.Contains(host, "byteimg"), // 抖音图片 CDN
 		strings.Contains(host, "douyinpic"),
 		strings.Contains(host, "douyinvod"),
-		strings.Contains(host, "pstatp"): // 抖音音乐/媒体 CDN（字节跳动）
+		strings.Contains(host, "douyinstatic"), // 音乐对象存储（ies-music）
+		strings.Contains(host, "pstatp"),       // 抖音音乐/媒体 CDN（字节跳动）
+		strings.Contains(host, "snssdk"),       // 字节系 CDN 泛域名
+		strings.Contains(host, "amemv"),        // 字节系 CDN 泛域名
+		strings.Contains(host, "muscdn"):       // 字节音乐 CDN
 		return "douyin"
 	case strings.Contains(host, "xiaohongshu"),
 		strings.Contains(host, "xhscdn"):
@@ -186,17 +192,58 @@ func audioRequestMeta(u string) (referer, ua string) {
 	case strings.Contains(u, "xiaohongshu"), strings.Contains(u, "xhscdn"):
 		return "https://www.xiaohongshu.com/", ua
 	case strings.Contains(u, "douyin"), strings.Contains(u, "douyinvod"),
-		strings.Contains(u, "dycdn"), strings.Contains(u, "pstatp"),
-		strings.Contains(u, "zjcdn"), strings.Contains(u, "byteimg"):
+		strings.Contains(u, "douyinstatic"), strings.Contains(u, "dycdn"),
+		strings.Contains(u, "pstatp"), strings.Contains(u, "zjcdn"),
+		strings.Contains(u, "byteimg"), strings.Contains(u, "snssdk"),
+		strings.Contains(u, "amemv"), strings.Contains(u, "muscdn"):
 		return "https://www.douyin.com/", ua
 	default:
 		return "", ua
 	}
 }
 
+// audioMagic 音频容器魔数（前缀 → 说明）。用于识别响应体是否为真实音频：
+// 社媒 CDN 被限流时多返回 HTML 风控页或 JSON 错误体，若不加校验会被
+// 原样存成 .mp3，产出无法播放的坏文件且对用户无任何提示。
+var audioMagic = []struct {
+	prefix []byte
+	label  string
+}{
+	{[]byte("ID3"), "MP3(ID3)"},
+	{[]byte{0xFF, 0xFB}, "MP3"},
+	{[]byte{0xFF, 0xF3}, "MP3"},
+	{[]byte{0xFF, 0xF2}, "MP3"},
+	{[]byte("ftyp"), "M4A/MP4"}, // 偏移 4 字节处
+	{[]byte("OggS"), "OGG"},
+	{[]byte("fLaC"), "FLAC"},
+	{[]byte("RIFF"), "WAV"},
+	{[]byte("ADTS"), "AAC"},
+	{[]byte{0xFF, 0xF1}, "AAC"}, // ADTS 无 syncword 时
+}
+
+// looksLikeAudio 判断响应首字节是否匹配已知音频容器。
+// head 为响应体开头若干字节（至少 12 字节时才能覆盖 ftyp 分支）。
+func looksLikeAudio(head []byte) bool {
+	if len(head) >= 12 && string(head[4:8]) == "ftyp" {
+		return true // ISO BMFF：m4a/mp4
+	}
+	for _, m := range audioMagic {
+		if bytes.HasPrefix(head, m.prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// maxAudioTries 单个音频地址的最大尝试次数（首次 + 续传重试）。
+const maxAudioTries = 3
+
 // SaveAudio 下载音频文件到 dstDir（自定义文件名，缺省/非法时兜底 bgm）。
 // 扩展名按「用户显式指定 > URL 路径 > Content-Type > .mp3」解析，避免把
 // m4a 音频误存为 .mp3。
+//
+// 落盘前用魔数校验响应体：社媒 CDN 限流时返回的 HTML/JSON 错误页会被
+// 识别并拒绝，不会静默产出无法播放的坏文件。
 func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, error) {
 	audioURL = strings.TrimSpace(audioURL)
 	if audioURL == "" {
@@ -214,6 +261,29 @@ func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, 
 	}
 
 	referer, ua := audioRequestMeta(audioURL)
+	var lastErr error
+	for try := 0; try < maxAudioTries; try++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		dst, err := saveAudioOnce(ctx, audioURL, dstDir, name, referer, ua)
+		if err == nil {
+			return dst, nil
+		}
+		lastErr = err
+		// 风控/内容异常类错误重试无意义，直接返回
+		if errors.Is(err, errNotAudio) {
+			return "", err
+		}
+	}
+	return "", lastErr
+}
+
+// errNotAudio 响应体不是音频（多为风控页或错误 JSON）。
+var errNotAudio = errors.New("响应内容不是音频")
+
+// saveAudioOnce 单次下载尝试，失败时返回可重试的错误。
+func saveAudioOnce(ctx context.Context, audioURL, dstDir, name, referer, ua string) (string, error) {
 	req, err := newRequest(ctx, audioURL, referer, ua)
 	if err != nil {
 		return "", err
@@ -226,10 +296,29 @@ func SaveAudio(ctx context.Context, audioURL, dstDir, filename string) (string, 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d 音频下载失败: %s", resp.StatusCode, audioURL)
 	}
+
+	// 魔数校验：读满头部再决定是否继续落盘
+	head := make([]byte, 16)
+	n, err := io.ReadFull(resp.Body, head)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return "", err
+	}
+	head = head[:n]
+	if !looksLikeAudio(head) {
+		ct := resp.Header.Get("Content-Type")
+		return "", fmt.Errorf("%w（Content-Type=%s，可能是风控拦截或链接已失效）: %s",
+			errNotAudio, ct, audioURL)
+	}
+
 	dst := filepath.Join(dstDir, resolveAudioName(name, audioURL, resp.Header.Get("Content-Type")))
 	tmp := dst + ".part"
 	f, err := os.Create(tmp)
 	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(head); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return "", err
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
