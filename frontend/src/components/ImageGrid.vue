@@ -171,6 +171,7 @@ watch(
       >
         <img v-if="img.thumb" :src="img.thumb" :alt="img.name" loading="lazy" draggable="false" />
         <div v-else class="ph" :title="img.name">{{ img.loading ? '加载中…' : '无法预览' }}</div>
+        <div v-if="img.raw" class="raw-badge" title="缩略图生成失败，正在显示原图">原图</div>
         <button
           v-if="selectable"
           class="check"
@@ -302,6 +303,21 @@ watch(
 }
 .tile.active {
   box-shadow: 0 0 0 2.5px var(--accent), var(--shadow);
+}
+
+/* 原图兜底角标：缩略图生成失败改显原图时提示 */
+.raw-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(255, 159, 10, 0.85);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+  pointer-events: none;
 }
 .zoom-hint {
   position: absolute;

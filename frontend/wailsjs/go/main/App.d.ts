@@ -36,6 +36,8 @@ export function GetEngineStatus():Promise<Record<string, string>>;
 
 export function GetImageBase64(arg1:string,arg2:number):Promise<string>;
 
+export function GetImageRaw(arg1:string):Promise<string>;
+
 export function GetThumb(arg1:string,arg2:number):Promise<main.ThumbInfo>;
 
 export function ListImages(arg1:string):Promise<Array<string>>;

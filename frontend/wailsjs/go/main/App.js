@@ -66,6 +66,10 @@ export function GetImageBase64(arg1, arg2) {
   return window['go']['main']['App']['GetImageBase64'](arg1, arg2);
 }
 
+export function GetImageRaw(arg1) {
+  return window['go']['main']['App']['GetImageRaw'](arg1);
+}
+
 export function GetThumb(arg1, arg2) {
   return window['go']['main']['App']['GetThumb'](arg1, arg2);
 }

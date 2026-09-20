@@ -895,6 +895,44 @@ func (a *App) GetThumb(path string, maxW int) (*ThumbInfo, error) {
 	}, nil
 }
 
+// maxRawImageBytes 原图兜底的大小上限：data URL 经 IPC 传输，过大既慢又占内存。
+const maxRawImageBytes = 24 << 20 // 24 MiB
+
+// imageExtMime 图片扩展名 → MIME（原图兜底时决定 data URL 的媒体类型）。
+var imageExtMime = map[string]string{
+	".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+	".bmp": "image/bmp", ".webp": "image/webp", ".gif": "image/gif",
+	".tif": "image/tiff", ".tiff": "image/tiff",
+}
+
+// GetImageRaw 原图兜底：不做解码与缩放，按扩展名推断 MIME 后把文件字节原样
+// 编码为 data URL。供缩略图生成失败时前端直接显示原图——Go 侧解码器不认的
+// 格式变体（EXIF 异常、特殊 webp 等），浏览器解码器通常更宽容。
+func (a *App) GetImageRaw(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("路径为空")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("路径是目录: %s", path)
+	}
+	if st.Size() > maxRawImageBytes {
+		return "", fmt.Errorf("原图过大（%d MB），无法直接显示", st.Size()>>20)
+	}
+	mime := imageExtMime[strings.ToLower(filepath.Ext(path))]
+	if mime == "" {
+		mime = "image/jpeg" // 未知扩展名按 jpeg 兜底（浏览器会嗅探真实内容）
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
 // ZipDirectory 打包目录为 zip，返回生成路径。
 func (a *App) ZipDirectory(dir string) (string, error) {
 	dst := filepath.Join(workspaceDir(), fmt.Sprintf("去水印结果_%s.zip", time.Now().Format("20060102_150405")))

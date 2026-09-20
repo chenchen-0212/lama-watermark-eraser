@@ -12,6 +12,7 @@ import {
   ListImages,
   GetEngineStatus,
   ExportSourceZip,
+  GetImageRaw,
   AddQueueTasks,
   EnqueueInpaint,
   ListQueueTasks,
@@ -37,7 +38,7 @@ export const store = reactive({
   boxes: [], // [[x1,y1,x2,y2], ...] 原图像素坐标（多个水印区域）
   ratios: [], // [[x1,y1,x2,y2], ...] 0..1 比例
   mode: 'relative', // absolute | relative（默认按比例适配，兼容不同尺寸图集）
-  strategy: 'auto', // 处理策略: auto(智能)|original(整图)|crop(快速裁剪)
+  strategy: 'crop', // 处理策略: auto(智能)|original(整图)|crop(快速裁剪)；默认快速（用户偏好）
   engineStatus: 'idle', // AI 引擎状态机: idle | starting | ready | error
   engineMessage: '',
   dilate: 12,
@@ -336,6 +337,9 @@ async function loadMaterialIntoStore(platform, title, dir, files) {
 }
 
 // fillThumbs 逐张生成缩略图并就地替换占位条目（渐进出现在网格中）。
+// 兜底链（方案：缩略图失败显示原图）：缩略图失败重试一次 → 仍失败改用
+// GetImageRaw 原图直显（不缩放，浏览器解码更宽容，标记 raw 供角标展示）
+// → 原图也失败才置 failed（网格显示「无法预览」）。
 async function fillThumbs(items) {
   for (const item of items) {
     try {
@@ -344,8 +348,24 @@ async function fillThumbs(items) {
       item.width = t.width
       item.height = t.height
     } catch (e) {
-      item.failed = true
-      log(`缩略图生成失败: ${item.name}`, 'fail')
+      // 重试一次（瞬态读取/解码错误）
+      let ok = false
+      try {
+        const t = await GetThumb(item.path, 420)
+        item.thumb = t.thumb
+        item.width = t.width
+        item.height = t.height
+        ok = true
+      } catch (e2) {
+        try {
+          item.thumb = await GetImageRaw(item.path)
+          item.raw = true // 原图兜底（未缩放），网格加角标提示
+          ok = true
+        } catch (e3) {
+          item.failed = true
+          log(`缩略图与原图均无法加载: ${item.name}`, 'fail')
+        }
+      }
     }
     item.loading = false
   }
