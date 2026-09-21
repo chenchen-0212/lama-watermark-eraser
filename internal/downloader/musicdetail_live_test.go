@@ -28,34 +28,20 @@ func TestLiveDouyinMusicDetail(t *testing.T) {
 	// 复现故障机器场景：SSR 段解析不出任何可用地址
 	// music.id 取自用户上报的失败链接（7679463410022550307 是 music.id）
 	item := gjson.Parse(`{"music":{"id":"7679463410022550307","title":"","play_url":{"url_list":[],"uri":""}}}`)
-	name, urls := douyinMusicCandidates(ctx, item, "")
+	name, cands := douyinMusicCandidates(ctx, item, "")
 
-	t.Logf("name=%q candidates=%d", name, len(urls))
-	for i, u := range urls {
-		t.Logf("  [%d] %s", i, u)
+	t.Logf("name=%q candidates=%d", name, len(cands))
+	for i, c := range cands {
+		t.Logf("  [%d] source=%s %s", i, c.Source, c.URL)
 	}
-	if len(urls) == 0 {
+	if len(cands) == 0 {
 		t.Fatal("候选链为空 —— music/detail 兜底未生效")
 	}
 
-	// 候选链中的地址必须真实可探测（前 16 字节是音频魔数）
-	var okURL string
-	for _, u := range urls {
-		if err := probeAudio(ctx, u); err != nil {
-			t.Logf("probe 失败 %s: %v", u, err)
-			continue
-		}
-		okURL = u
-		break
-	}
-	if okURL == "" {
-		t.Fatalf("候选链中无可用地址（共 %d 条）：%v", len(urls), urls)
-	}
-	t.Logf("PASS: 可用地址 = %s", okURL)
-
-	// 端到端下载验证
+	// 端到端下载验证：下载过程本身即探测（先读头部做魔数校验，再继续写入
+	// 同一个响应体），无需额外发一轮 Range 预探测。
 	dst := t.TempDir()
-	saved, err := DownloadAudioWithFallback(ctx, urls, dst, "bgm")
+	saved, err := DownloadAudioWithFallback(ctx, cands, dst, "bgm")
 	if err != nil {
 		t.Fatalf("下载失败: %v", err)
 	}

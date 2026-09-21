@@ -5,7 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 #
 # 可选参数：
-#   -Version 1.1.9    覆盖版本号（缺省读取 wails.json 的 productVersion）
+#   -Version 1.1.10    覆盖版本号（缺省读取 wails.json 的 productVersion）
 #   -SkipEngine       跳过 lamacore 引擎重建（已有 python_engine\dist\lamacore 时用，省几十分钟）
 #   -SkipApp          跳过主程序重建（只重打安装器）
 #

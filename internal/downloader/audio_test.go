@@ -80,7 +80,7 @@ func TestDouyinMusicCandidates(t *testing.T) {
 	// url_list 全部收录（保序）→ uri(是URL才收) → detail 兜底追加在链尾
 	item := gjson.Parse(`{"music":{"id":"7286820160101201977","title":"测试歌曲","author":"歌手A",
 		"play_url":{"uri":"v0200fg10000abcdef","url_list":["","http://cdn/b.mp3","http://cdn/c.mp3"]}}}`)
-	name, urls := douyinMusicCandidates(context.Background(), item, "")
+	name, cands := douyinMusicCandidates(context.Background(), item, "")
 	if name != "测试歌曲" {
 		t.Errorf("name = %q, want 测试歌曲", name)
 	}
@@ -89,24 +89,29 @@ func TestDouyinMusicCandidates(t *testing.T) {
 		"http://cdn/c.mp3",
 		"http://detail/fallback.mp3", // detail 地址并入链尾（SSR 地址失效时的兜底）
 	}
-	if !equalStrings(urls, want) {
-		t.Errorf("urls = %v, want %v", urls, want)
+	if got := candidateURLs(cands); !equalStrings(got, want) {
+		t.Errorf("urls = %v, want %v", got, want)
+	}
+	// 来源标注必须与取源级别对应，否则日志与排序都无从判断是谁失败了
+	wantSrc := []string{SourceDouyinSSRURLList, SourceDouyinSSRURLList, SourceDouyinMusicDetail}
+	if got := candidateSources(cands); !equalStrings(got, wantSrc) {
+		t.Errorf("sources = %v, want %v", got, wantSrc)
 	}
 
 	// uri 是资源标识（非 URL）→ 不得收录；无 music.id → 不查 detail
 	item2 := gjson.Parse(`{"music":{"title":"歌2","play_url":{"uri":"v0200fg10000xyz","url_list":["http://cdn/d.mp3"]}}}`)
-	name2, urls2 := douyinMusicCandidates(context.Background(), item2, "")
+	name2, cands2 := douyinMusicCandidates(context.Background(), item2, "")
 	if name2 != "歌2" {
 		t.Errorf("name2 = %q, want 歌2", name2)
 	}
-	if !equalStrings(urls2, []string{"http://cdn/d.mp3"}) {
-		t.Errorf("urls2 = %v, want 仅列表项（uri 非 URL 不应收录）", urls2)
+	if got := candidateURLs(cands2); !equalStrings(got, []string{"http://cdn/d.mp3"}) {
+		t.Errorf("urls2 = %v, want 仅列表项（uri 非 URL 不应收录）", got)
 	}
 
 	// 无 music 节点 → 不 panic，返回空
-	name3, urls3 := douyinMusicCandidates(context.Background(), gjson.Parse(`{"music":{}}`), "")
-	if name3 != "" || len(urls3) != 0 {
-		t.Errorf("empty music: name=%q urls=%v, want empty", name3, urls3)
+	name3, cands3 := douyinMusicCandidates(context.Background(), gjson.Parse(`{"music":{}}`), "")
+	if name3 != "" || len(cands3) != 0 {
+		t.Errorf("empty music: name=%q cands=%v, want empty", name3, cands3)
 	}
 }
 
@@ -166,6 +171,9 @@ func TestLooksLikeAudio(t *testing.T) {
 		{"FLAC", []byte("fLaC\x00\x00\x00\x22"), true},
 		{"WAV", []byte("RIFF\x24\x08\x00\x00WAVE"), true},
 		{"AAC(ADTS)", []byte{0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC}, true},
+		{"AAC(ADIF)", []byte("ADIF\x00\x00\x00\x00"), true},
+		{"AMR", []byte("#!AMR\n\x00\x00\x00"), true},
+		{"WMA/ASF", []byte{0x30, 0x26, 0xB2, 0x75, 0x00, 0x00, 0x00, 0x00}, true},
 		{"风控 HTML 页", []byte("<html><head><title>"), false},
 		{"错误 JSON", []byte(`{"status_code":8}`), false},
 		{"空响应", []byte{}, false},
@@ -190,6 +198,15 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// candidateSources 抽取候选链的来源标识（日志/排序所依赖的字段）。
+func candidateSources(cands []AudioCandidate) []string {
+	out := make([]string, len(cands))
+	for i, c := range cands {
+		out[i] = c.Source
+	}
+	return out
+}
+
 // TestDouyinMusicCandidatesRealWorld 回归用例，取自 2026-09-15 真实链接实测
 // （https://v.douyin.com/tLyloNrTWmA/ → note/7397543688773094656）。
 //
@@ -204,7 +221,8 @@ func TestDouyinMusicCandidatesRealWorld(t *testing.T) {
 			"uri":"https://sf3-cdn-tos.douyinstatic.com/obj/ies-music/6634113815568976654.mp3",
 			"url_list":["https://sf11-cdn-tos.douyinstatic.com/obj/tos-cn-ve-2774/ocO5kAYT3Pn2gtCjQXxtBQFvgDeeZNwDD3ySbz"]
 		}}}`
-	name, urls := douyinMusicCandidates(context.Background(), gjson.Parse(raw), "")
+	name, cands := douyinMusicCandidates(context.Background(), gjson.Parse(raw), "")
+	urls := candidateURLs(cands)
 
 	if name != "長沙-剪辑版一先贻jUju" {
 		t.Errorf("name = %q", name)
@@ -243,33 +261,34 @@ func TestUriAcceptedWhenHTTP(t *testing.T) {
 	}
 }
 
-// douyinMusicCandidates0 只测 SSR 段（不触发 detail API 网络请求）。
+// douyinMusicCandidates0 只测 SSR 段：转交真实实现，用例中的 music 节点均无 id，
+// 因此不会触发 detail 接口请求。
 func douyinMusicCandidates0(music gjson.Result) []string {
-	var urls []string
-	for _, u := range music.Get("play_url.url_list").Array() {
-		if s := trimSpace(u.String()); strings.HasPrefix(s, "http") {
-			urls = append(urls, s)
-		}
-	}
-	if u := trimSpace(music.Get("play_url.uri").String()); strings.HasPrefix(u, "http") {
-		urls = append(urls, u)
-	}
-	return urls
+	item := gjson.Parse(`{"music":` + music.Raw + `}`)
+	_, cands := douyinMusicCandidates(context.Background(), item, "")
+	return candidateURLs(cands)
 }
 
 func TestXHSMusic(t *testing.T) {
 	// url 字段
 	note := gjson.Parse(`{"music":{"name":"歌名B","url":"http://y/a.mp3"}}`)
-	if u, n := xhsMusic(note); u != "http://y/a.mp3" || n != "歌名B" {
-		t.Errorf("url field: url=%q name=%q", u, n)
+	if cands, n := xhsMusic(note); !equalStrings(candidateURLs(cands), []string{"http://y/a.mp3"}) || n != "歌名B" {
+		t.Errorf("url field: cands=%v name=%q", cands, n)
 	}
 	// attachUrl 兜底 + singer 兜底
 	note2 := gjson.Parse(`{"music":{"singer":"歌手C","attachUrl":"http://y/b.m4a"}}`)
-	if u, n := xhsMusic(note2); u != "http://y/b.m4a" || n != "歌手C" {
-		t.Errorf("attachUrl fallback: url=%q name=%q", u, n)
+	if cands, n := xhsMusic(note2); !equalStrings(candidateURLs(cands), []string{"http://y/b.m4a"}) || n != "歌手C" {
+		t.Errorf("attachUrl fallback: cands=%v name=%q", cands, n)
+	}
+	// 三字段同时存在：全部收进候选链，而非只取首个——多一层兜底
+	note3 := gjson.Parse(`{"music":{"name":"歌名D","url":"http://y/c.mp3",` +
+		`"musicUrl":"http://y/d.mp3","attachUrl":"http://y/e.mp3"}}`)
+	if cands, _ := xhsMusic(note3); !equalStrings(candidateURLs(cands),
+		[]string{"http://y/c.mp3", "http://y/d.mp3", "http://y/e.mp3"}) {
+		t.Errorf("multi-field: cands=%v, want 三字段全部收录", candidateURLs(cands))
 	}
 	// 无 BGM
-	if u, _ := xhsMusic(gjson.Parse(`{}`)); u != "" {
-		t.Errorf("no music: url=%q, want empty", u)
+	if cands, _ := xhsMusic(gjson.Parse(`{}`)); len(cands) != 0 {
+		t.Errorf("no music: cands=%v, want empty", cands)
 	}
 }

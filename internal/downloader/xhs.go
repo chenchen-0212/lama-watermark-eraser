@@ -118,24 +118,34 @@ func DownloadXHS(ctx context.Context, url, outDir string) (*Post, error) {
 	if post.Count == 0 {
 		return nil, fmt.Errorf("图片下载全部失败（可能触发风控，请稍后重试或配置 Cookie）")
 	}
-	post.AudioURL, post.AudioName = xhsMusic(note)
+	// 走与抖音相同的候选模型：修复此前直接赋值 AudioURL、导致 AudioCandidates
+	// 恒为空数组的缺陷——前端 audioCandidates() 只能退化成单地址，丢失降级能力。
+	musicCands, audioName := xhsMusic(note)
+	post.SetAudioCandidates(audioName, trimSpace(note.Get("music.id").String()), musicCands...)
 	return post, nil
 }
 
-// xhsMusic 提取笔记 BGM（音频 URL 与曲目名）。部分笔记无 BGM，返回空串。
-// URL 字段在不同版本页面中可能是 url / musicUrl / attachUrl，逐一尝试。
-func xhsMusic(note gjson.Result) (audioURL, audioName string) {
+// xhsMusic 提取笔记 BGM 候选链与曲目名。部分笔记无 BGM，返回空。
+//
+// 三个字段全部收进候选链，而非只取第一个：不同版本的页面可能只填其中一个，
+// 全收不增加失败成本（逐条尝试、命中即停），却能在字段缺失时多一层兜底。
+func xhsMusic(note gjson.Result) (cands []AudioCandidate, audioName string) {
+	// URL 字段在不同版本页面中可能是 url / musicUrl / attachUrl，逐一尝试。
 	for _, f := range []string{"url", "musicUrl", "attachUrl"} {
-		if u := strings.TrimSpace(note.Get("music." + f).String()); u != "" {
-			audioURL = u
-			break
+		if u := trimSpace(note.Get("music." + f).String()); u != "" {
+			cands = append(cands, AudioCandidate{
+				URL:      u,
+				Source:   SourceXHSMusic,
+				Priority: len(cands),
+			})
 		}
 	}
-	audioName = strings.TrimSpace(note.Get("music.name").String())
+	cands = DedupCandidates(cands)
+	audioName = trimSpace(note.Get("music.name").String())
 	if audioName == "" {
-		audioName = strings.TrimSpace(note.Get("music.singer").String())
+		audioName = trimSpace(note.Get("music.singer").String())
 	}
-	return audioURL, audioName
+	return cands, audioName
 }
 
 func imgExtFromURL(u string) string {

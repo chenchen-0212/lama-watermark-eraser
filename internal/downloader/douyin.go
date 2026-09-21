@@ -139,25 +139,33 @@ func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 	if post.Count == 0 {
 		return nil, fmt.Errorf("图片下载全部失败（可能触发风控，请稍后重试）")
 	}
-	name, urls := douyinMusicCandidates(ctx, item, id)
-	post.SetAudio(name, urls...)
+	name, cands := douyinMusicCandidates(ctx, item, id)
+	// music_id 一并登记：它是比 CDN 地址稳定得多的业务标识，
+	// 供试听缓存优先采用（避免签名/主机变化导致缓存永不命中）。
+	post.SetAudioCandidates(name, musicID(item.Get("music")), cands...)
 	return post, nil
 }
 
 // douyinMusicCandidates 汇总抖音 BGM 的全部取源并按「实测可靠性」排序。
 //
-// 排序依据（2026-09-15 真实链接实测校准）：
-//  1. SSR 页面 play_url.url_list 中的 http(s) 地址 —— 官方下发，实测可用，
-//     故置于最前（旧实现只取 url_list[0]，而该条可能恰为 404 失效项）；
-//  2. play_url.uri —— 仅当它本身就是 http(s) 地址时收录；
-//  3. music/detail 接口（按 music.id 查询，实测免签名）—— 始终并入链尾；
-//  4. aweme/detail 接口（需 a_bogus/msToken，最后手段）。
+// 候选优先级（2026-09-21 按真实链接重新校准）：
+//  1. video.play_addr.uri —— 图文帖（aweme_type=2）的 BGM 实际挂载点。
+//     图文帖的 music 节点常常只有 mid、**完全没有 play_url**（实测
+//     https://v.douyin.com/Y-dKHMoB8_g/ 即为此形态），此时 ①②③④ 全空，
+//     唯一可用的地址就在这里。uri 形如
+//     https://lf26-music-east.douyinstatic.com/obj/ies-music-hj/{fileID}.mp3
+//     实测无 Referer/无 Cookie 即可 GET 到 audio/mpeg，故置于链首。
+//  2. SSR music.play_url.url_list 中的 http(s) 地址 —— 官方下发。
+//  3. music.play_url.uri —— 仅当它本身就是 http(s) 地址时收录。
+//  4. music/detail 接口（按 music.id 查询）。
+//     注意：该接口自 2026-09-21 实测已被 Argus 风控拦截，返回
+//     403 "Blocked by ArgusSecurityPlugin Uifid Not Found"，无论是否带
+//     Cookie。保留它仅作为接口策略可能回滚的兜底，不再视为主力。
+//  5. aweme/detail 接口（需 a_bogus/msToken，最后手段）。
 //
-// ③ 为什么始终并入而非「仅 SSR 为空时」：SSR 下发的地址带时效签名/地域限制，
-// 存在「同一链接昨日可用、今日全部 403/404」的偶发失效（抖音风控的典型表现）。
-// 若此时因 len(urls)>0 跳过 ③，候选链里就没有任何可用地址，BGM 必然失败。
-// 并入链尾不增加成功路径的成本——failover 逐条尝试、命中即停，仅当 ①② 全部
-// 失效时才会真正请求 ③ 的地址（解析期的 detail 查询本身约百余毫秒）。
+// 为什么 ③④ 仍始终并入链尾：SSR 下发的地址带时效签名/地域限制，存在
+// 「同一链接昨日可用、今日全部 403/404」的偶发失效。failover 逐条尝试、
+// 命中即停，并入链尾不增加成功路径的成本（仅当 ①② 全部失效时才真正请求）。
 //
 // uri 字段通常是资源标识（形如 v0200fg10000...）而非可 GET 的 URL，
 // 只有它是 http(s) 地址时才收录，避免把它当 URL 传给下载器后报「地址无效」，
@@ -167,7 +175,9 @@ func DownloadDouyin(ctx context.Context, url, outDir string) (*Post, error) {
 // 直链，实测该路径对绝大多数曲目返回 404——对象存储的文件名 ID 与 music.id
 // 是**两个不同的资源 ID**（例：music.id=7679463410022550307 对应
 // ies-music-hj/7679463571897502513.mp3），无法自行推导，只能走接口获取。
-func douyinMusicCandidates(ctx context.Context, item gjson.Result, id string) (name string, urls []string) {
+// 本次新收录的 video.play_addr.uri 再次印证该规律：music.mid=7505383933425879858
+// 对应的实际文件是 ies-music-hj/7505383972596108090.mp3，仍然不同。
+func douyinMusicCandidates(ctx context.Context, item gjson.Result, id string) (name string, cands []AudioCandidate) {
 	music := item.Get("music")
 	name = trimSpace(music.Get("title").String())
 	if name == "" {
@@ -176,43 +186,52 @@ func douyinMusicCandidates(ctx context.Context, item gjson.Result, id string) (n
 
 	// 本地去重：SSR 的 uri 与实际可用地址可能重复，
 	// 保留重复项会让 failover 白跑一次探测。
-	add := func(u string) {
+	add := func(u, source string) {
 		u = trimSpace(u)
 		if u == "" {
 			return
 		}
-		for _, e := range urls {
-			if e == u {
+		for _, e := range cands {
+			if e.URL == u {
 				return
 			}
 		}
-		urls = append(urls, u)
+		cands = append(cands, AudioCandidate{URL: u, Source: source, Priority: len(cands)})
+	}
+
+	// ① 图文帖 BGM：music 节点无 play_url 时，真实音频挂在 video.play_addr。
+	// 优先取 uri（对象存储直链，实测免签名可直下），其次取 url_list。
+	// 仅对图文帖（有 images）启用：视频帖的 video.play_addr 是视频本体而非 BGM，
+	// 收录它会把整个视频当音频下载。
+	if len(item.Get("images").Array()) > 0 {
+		if u := trimSpace(item.Get("video.play_addr.uri").String()); strings.HasPrefix(u, "http") {
+			add(u, SourceDouyinImagePlayAddr)
+		}
 	}
 
 	for _, u := range music.Get("play_url.url_list").Array() {
 		if s := trimSpace(u.String()); strings.HasPrefix(s, "http") {
-			add(s)
+			add(s, SourceDouyinSSRURLList)
 		}
 	}
 	if u := trimSpace(music.Get("play_url.uri").String()); strings.HasPrefix(u, "http") {
-		add(u)
+		add(u, SourceDouyinSSRURI)
 	}
 
-	// ③ 始终并入链尾（见函数头注释）：SSR 地址有时效性，detail 接口实时
-	// 下发的地址是最后一道可靠兜底。musicID 为空时 douyinMusicDetailURL
+	// ④ 始终并入链尾（见函数头注释）。musicID 为空时 douyinMusicDetailURL
 	// 直接返回 nil（不发请求）。
 	for _, u := range douyinMusicDetailURL(ctx, musicID(music)) {
-		add(u)
+		add(u, SourceDouyinMusicDetail)
 	}
 
 	// 末位兜底：aweme/detail（需签名，被风控时静默返回空）
 	if u, n := douyinDetailMusicURL(ctx, id); u != "" {
-		add(u)
+		add(u, SourceDouyinAwemeDetail)
 		if name == "" {
 			name = n
 		}
 	}
-	return name, urls
+	return name, cands
 }
 
 // musicID 取 music 节点的数字 ID，缺失时回落 mid。
@@ -287,6 +306,11 @@ func isNumericID(s string) bool {
 // 注意：该接口需 a_bogus/msToken/ttwid 齐备才稳定可用，本函数未做签名，
 // 仅作为候选链的最后一级兜底；被风控时返回空串。
 func douyinDetailMusicURL(ctx context.Context, id string) (audioURL, audioName string) {
+	// 空 ID 直接返回：避免构造出 aweme_id= 的无效请求——既无意义，
+	// 又会让不依赖网络的单测意外打到真实接口。
+	if trimSpace(id) == "" {
+		return "", ""
+	}
 	api := "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=" + id +
 		"&aid=6383&cookie_enabled=true&platform=PC&downlink=1"
 	data, _, err := httpGet(ctx, api, "https://www.douyin.com/", BrowserUA)
@@ -309,21 +333,43 @@ func douyinDetailMusicURL(ctx context.Context, id string) (audioURL, audioName s
 }
 
 // findDouyinItem 在 _ROUTER_DATA 的 loaderData 中定位 item_list 第一项。
+//
+// 两条取数路径（实测 2026-09-21）：
+//   - 分享页：loaderData["note_(id)/page"].videoInfoRes.item_list
+//   - 桌面页/新版：loaderData["note_(<真实id>)/page"].videoInfoRes.item_list
+//
+// 关键坑一：分享页的键名里 **(id) 是字面文本**，不是占位符——
+// 真实键名字节就是 `note_(id)/page`（实测 hex: 6e 6f 74 65 5f 28 69 64 29 2f 70 61 67 65），
+// 而**不是** `note_(<作品ID>)/page`。早期只用后者拼接，分享页永远匹配不上。
+//
+// 关键坑二：gjson 路径里**不要给键名加引号**。`(` `)` `/` 都不是 gjson 的
+// 保留字符，无需转义；写成 `"note_(id)/page"` 反而会把双引号当成键名的一部分，
+// 导致 Exists 恒为 false。实测：
+//
+//	loader.Get(`"note_(id)/page".videoInfoRes.item_list.0`)  // false ✗
+//	loader.Get("note_(id)/page.videoInfoRes.item_list.0")    // true  ✓
+//
+// 该写法 bug 曾长期存在，只因下方遍历兜底能救回来而未暴露；代价是每次解析
+// 白跑 9 次必然失败的精确查询。现已修正。
 func findDouyinItem(root gjson.Result, id string) gjson.Result {
 	loader := root.Get("loaderData")
 	if !loader.Exists() {
 		return gjson.Result{}
 	}
-	// 优先精确键。新版桌面页键名形如 "note_(id)/page"（id 带括号），
-	// 旧版分享页为 "note_{id}/page"（无括号），两种都试。
 	for _, prefix := range []string{
+		// 分享页字面量键（(id) 为字面文本，注意与下方拼接键区分）
+		"note_(id)/page",
+		"video_(id)/page",
+		"slides_(id)/page",
+		// 新版桌面页：键名嵌真实 id
 		"note_(" + id + ")/page",
 		"note_" + id + "/page",
 		"video_(" + id + ")/page",
 		"video_" + id + "/page",
 		"slides_" + id + "/page",
+		"slides_(" + id + ")/page",
 	} {
-		if v := loader.Get(fmt.Sprintf(`"%s".videoInfoRes.item_list.0`, prefix)); v.Exists() {
+		if v := loader.Get(prefix + ".videoInfoRes.item_list.0"); v.Exists() {
 			return v
 		}
 	}

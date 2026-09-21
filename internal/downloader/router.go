@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -76,95 +75,67 @@ func isDouyinVideoURL(u string) bool {
 	return strings.Contains(p.Path, "/video/")
 }
 
-// probeAudio 探测单个音频地址是否返回真实音频（只读响应头与前 16 字节）。
-func probeAudio(ctx context.Context, audioURL string) error {
-	if strings.TrimSpace(audioURL) == "" {
-		return fmt.Errorf("音频地址为空")
-	}
-	if !strings.HasPrefix(audioURL, "http://") && !strings.HasPrefix(audioURL, "https://") {
-		return fmt.Errorf("音频地址无效: %s", audioURL)
-	}
-	referer, ua := audioRequestMeta(audioURL)
-	req, err := newRequest(ctx, audioURL, referer, ua)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Range", "bytes=0-15")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	// 200（不支持 Range 时返回全量）与 206（部分内容）均可接受
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, audioURL)
-	}
-	head := make([]byte, 16)
-	n, err := io.ReadFull(resp.Body, head)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		return err
-	}
-	if !looksLikeAudio(head[:n]) {
-		return fmt.Errorf("%w（Content-Type=%s）: %s", errNotAudio, resp.Header.Get("Content-Type"), audioURL)
-	}
-	return nil
-}
-
-// usableCandidates 过滤掉空白候选，返回真正可尝试的地址列表。
-func usableCandidates(candidates []string) []string {
-	out := make([]string, 0, len(candidates))
-	for _, u := range candidates {
-		if strings.TrimSpace(u) != "" {
-			out = append(out, u)
-		}
-	}
-	return out
-}
-
-// PickAudioSource 按候选链顺序尝试音频源，返回首个可用的真实音频地址。
+// usableAudioCandidates 过滤空地址并按等价标识去重。
 //
-// 存在的意义：社媒音频 CDN 的单个地址随时可能 403 或过期，而同一曲目在解析
-// 结果中往往有多个备用地址。此前只取第一条，单点失败即整体失败。
-//
-// 采用「探测」而非「下载后判定」：探针只读 16 字节（配合 Range 请求），校验
-// 通过即返回该地址交给后续完整下载，避免把整段音频读两遍。全部候选失败时
-// 返回最后一个错误，供上层给出可操作的提示。
-func PickAudioSource(ctx context.Context, candidates []string) (string, error) {
-	list := usableCandidates(candidates)
-	if len(list) == 0 {
-		return "", fmt.Errorf("未解析到 BGM 音频地址（可能该帖无 BGM，或页面结构变更导致解析降级）")
-	}
-	var lastErr error
-	for _, u := range list {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if err := probeAudio(ctx, u); err != nil {
-			lastErr = err
+// 去重不只比对字面量：同一 BGM 常被下发到多个 CDN 节点（host 与 sign 不同、
+// path 相同），字面量不同却实为同一文件，重复尝试只是白费请求。
+func usableAudioCandidates(cands []AudioCandidate) []AudioCandidate {
+	out := make([]AudioCandidate, 0, len(cands))
+	for _, c := range cands {
+		if trimSpace(c.URL) == "" {
 			continue
 		}
-		return u, nil
+		out = append(out, c)
 	}
-	return "", fmt.Errorf("BGM 地址全部探测失败（%d 个候选，最后错误：%v）", len(list), lastErr)
+	return DedupCandidates(out)
 }
 
 // DownloadAudioWithFallback 依次尝试候选地址，返回首个下载成功的文件路径。
-func DownloadAudioWithFallback(ctx context.Context, candidates []string, dstDir, filename string) (string, error) {
-	list := usableCandidates(candidates)
+//
+// 重试分两层，职责不重叠：
+//   - 候选级：同一地址内由 SaveAudioCandidate 按错误类型决定重试次数
+//     （404、非音频内容只试一次；网络类错误退避后重试）；
+//   - 链级：本函数只在候选之间推进，某个候选判定为不可恢复即立刻换下一个。
+//
+// 与旧实现的关键差异：不再「整条链失败 → 睡一会 → 整条链重跑一遍」。
+// 链级重跑改由上层在确认错误可恢复时发起，避免对必然失败的地址重复施压。
+//
+// 候选顺序先经 RankAudioCandidates 调整（历史成功来源前移），失败原因逐条记录。
+func DownloadAudioWithFallback(ctx context.Context, candidates []AudioCandidate, dstDir, filename string) (string, error) {
+	list := usableAudioCandidates(candidates)
 	if len(list) == 0 {
 		return "", fmt.Errorf("未解析到 BGM 音频地址（可能该帖无 BGM，或页面结构变更导致解析降级）")
 	}
+	list = RankAudioCandidates(list)
+
+	chainKey := CandidateChainKey(candidateURLs(list))
+	var failures []string
 	var lastErr error
-	for _, u := range list {
+	for i, cand := range list {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		saved, err := SaveAudio(ctx, u, dstDir, filename)
+		saved, err := SaveAudioCandidate(ctx, cand, i, dstDir, filename)
 		if err == nil {
+			recordAudioSuccess(chainKey, cand.Source)
+			audioLog(fmt.Sprintf("audio download done candidate_count=%d used_index=%d used_source=%s",
+				len(list), i, sourceLabel(cand.Source)))
 			return saved, nil
 		}
+		recordAudioFailure(chainKey, cand.Source, kindOf(err))
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		// 无分类错误 = 本地致命问题（磁盘/权限），换源无意义
+		if kindOf(err) == "" {
+			return "", err
+		}
+		failures = append(failures,
+			fmt.Sprintf("candidate[%d] source=%s error=%s", i, sourceLabel(cand.Source), kindOf(err)))
 		lastErr = err
 	}
+	audioLog(fmt.Sprintf("audio download failed candidate_count=%d detail=%s",
+		len(list), strings.Join(failures, "; ")))
 	return "", fmt.Errorf("BGM 下载失败（已尝试 %d 个地址，最后错误：%w）", len(list), lastErr)
 }
 

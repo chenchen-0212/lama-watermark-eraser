@@ -17,8 +17,9 @@ type fakeExecutor struct {
 	mu      sync.Mutex
 	dlCalls []string // 依次执行的 download 任务 URL
 	ipCalls []string // 依次执行的 inpaint 任务 InDir
-	dlFn    func(ctx context.Context, t *BatchTask) (string, string, []string, error)
+	dlFn    func(ctx context.Context, t *BatchTask) (DownloadResult, error)
 	ipFn    func(ctx context.Context, t *BatchTask) (InpaintResult, error)
+	auFn    func(ctx context.Context, t *BatchTask) ([]string, string, error)
 	started chan *BatchTask // 每次开始执行推入
 }
 
@@ -26,7 +27,7 @@ func newFakeExecutor() *fakeExecutor {
 	return &fakeExecutor{started: make(chan *BatchTask, 64)}
 }
 
-func (f *fakeExecutor) RunDownload(ctx context.Context, t *BatchTask) (string, string, []string, error) {
+func (f *fakeExecutor) RunDownload(ctx context.Context, t *BatchTask) (DownloadResult, error) {
 	f.mu.Lock()
 	f.dlCalls = append(f.dlCalls, t.URL)
 	fn := f.dlFn
@@ -35,7 +36,21 @@ func (f *fakeExecutor) RunDownload(ctx context.Context, t *BatchTask) (string, s
 	if fn != nil {
 		return fn(ctx, t)
 	}
-	return "/dl/" + t.URL, "帖子A | 3 张", []string{"/dl/01.jpg", "/dl/02.jpg"}, nil
+	return DownloadResult{
+		Dir:     "/dl/" + t.URL,
+		PostRef: "帖子A | 3 张",
+		Files:   []string{"/dl/01.jpg", "/dl/02.jpg"},
+	}, nil
+}
+
+func (f *fakeExecutor) ResolveTaskAudio(ctx context.Context, t *BatchTask) ([]string, string, error) {
+	f.mu.Lock()
+	fn := f.auFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, t)
+	}
+	return nil, "", nil
 }
 
 func (f *fakeExecutor) RunInpaint(ctx context.Context, t *BatchTask, onProgress ProgressFn) (InpaintResult, error) {
@@ -163,12 +178,12 @@ func TestSameTypeSerial(t *testing.T) {
 func TestQueueCap(t *testing.T) {
 	exec := newFakeExecutor()
 	block := make(chan struct{})
-	exec.dlFn = func(ctx context.Context, t *BatchTask) (string, string, []string, error) {
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (DownloadResult, error) {
 		select {
 		case <-block:
 		case <-ctx.Done():
 		}
-		return "", "", nil, ctx.Err()
+		return DownloadResult{}, ctx.Err()
 	}
 	q := newTestQueue(exec)
 	defer func() {
@@ -350,11 +365,195 @@ func TestRetryLimit(t *testing.T) {
 	}
 }
 
+// TestDownloadBackfillsAudio 下载任务完成后 BGM 取源随任务落库，
+// 且 AudioChecked 置位（区分「确认无 BGM」与「未曾探测」）。
+func TestDownloadBackfillsAudio(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (DownloadResult, error) {
+		return DownloadResult{
+			Dir:      "/dl/x",
+			PostRef:  "图文帖 | 100 张",
+			Files:    []string{"/dl/x/01.jpg"},
+			AudioURL: "https://cdn/a.mp3",
+			Audio:    []string{"https://cdn/a.mp3", "https://cdn/b.mp3"},
+			AudioNm:  "某曲目",
+		}, nil
+	}
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	tk, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/1"})
+	waitFor(t, func() bool { return taskState(q, tk.ID) == StateDone }, "下载任务应完成")
+
+	var got BatchTask
+	for _, s := range q.Snapshot() {
+		if s.ID == tk.ID {
+			got = s
+		}
+	}
+	if got.AudioURL != "https://cdn/a.mp3" {
+		t.Errorf("AudioURL = %q，期望候选链首项", got.AudioURL)
+	}
+	if len(got.AudioCandidates) != 2 {
+		t.Errorf("AudioCandidates = %v，期望 2 条", got.AudioCandidates)
+	}
+	if got.AudioName != "某曲目" {
+		t.Errorf("AudioName = %q", got.AudioName)
+	}
+	if !got.AudioChecked {
+		t.Error("AudioChecked 应为 true：本轮已探测过 BGM（即便为空也要置位）")
+	}
+}
+
+// TestDownloadAudioNotBackfilledOnFailure 失败任务不覆写既有 BGM 取源
+// （重试前的有效结果不能被零值冲掉）。
+func TestDownloadAudioNotBackfilledOnFailure(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (DownloadResult, error) {
+		return DownloadResult{}, Permanent(errors.New("该链接是视频内容，暂不支持"))
+	}
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	tk, _ := q.Enqueue(&BatchTask{
+		Type:            TypeDownload,
+		URL:             "https://x/v",
+		AudioURL:        "https://cdn/keep.mp3",
+		AudioCandidates: []string{"https://cdn/keep.mp3"},
+		AudioChecked:    true,
+	})
+	waitFor(t, func() bool { return taskState(q, tk.ID) == StateFailed }, "应 failed")
+
+	for _, s := range q.Snapshot() {
+		if s.ID != tk.ID {
+			continue
+		}
+		if s.AudioURL != "https://cdn/keep.mp3" || len(s.AudioCandidates) != 1 {
+			t.Errorf("失败任务不应覆写 BGM 取源，得到 url=%q cands=%v", s.AudioURL, s.AudioCandidates)
+		}
+	}
+}
+
+// TestResolveTaskAudio 历史任务（无 BGM 数据）回源补取一次并写回任务；
+// 二次调用命中 AudioChecked 缓存，不再回源。
+func TestResolveTaskAudio(t *testing.T) {
+	exec := newFakeExecutor()
+	resolveCalls := 0
+	exec.auFn = func(ctx context.Context, t *BatchTask) ([]string, string, error) {
+		resolveCalls++
+		return []string{"https://cdn/late.mp3"}, "补取曲目", nil
+	}
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	// 模拟历史任务：入队时 AudioChecked 为未置位（该字段此前不存在）。
+	// 但本轮下载会正常解析并置位，故先断言置位，再验证不重复回源。
+	tk, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/legacy"})
+	waitFor(t, func() bool { return taskState(q, tk.ID) == StateDone }, "应完成")
+
+	cands, name, err := q.ResolveTaskAudio(context.Background(), tk.ID)
+	if err != nil {
+		t.Fatalf("ResolveTaskAudio 出错: %v", err)
+	}
+	if len(cands) != 1 || cands[0] != "https://cdn/late.mp3" || name != "补取曲目" {
+		t.Errorf("补取结果 = %v / %q", cands, name)
+	}
+	for _, s := range q.Snapshot() {
+		if s.ID == tk.ID && (s.AudioURL != "https://cdn/late.mp3" || !s.AudioChecked) {
+			t.Errorf("补取结果未写回任务: url=%q checked=%v", s.AudioURL, s.AudioChecked)
+		}
+	}
+
+	// 二次调用：AudioChecked 已置位，直接返回缓存，不再回源
+	if _, _, err := q.ResolveTaskAudio(context.Background(), tk.ID); err != nil {
+		t.Fatalf("二次调用出错: %v", err)
+	}
+	if resolveCalls != 1 {
+		t.Errorf("回源调用 %d 次，期望 1 次（已探测过应走缓存）", resolveCalls)
+	}
+}
+
+// TestResolveTaskAudioUncheckedLegacy 未探测过的历史任务（AudioChecked 未置位）
+// 必须走回源补取，而不是把「空候选链」当成「确认无 BGM」。
+func TestResolveTaskAudioUncheckedLegacy(t *testing.T) {
+	exec := newFakeExecutor()
+	resolveCalls := 0
+	exec.auFn = func(ctx context.Context, t *BatchTask) ([]string, string, error) {
+		resolveCalls++
+		return []string{"https://cdn/legacy.mp3"}, "历史曲目", nil
+	}
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	// 直接构造一个未探测过的任务条目（模拟旧版本持久化数据）
+	q.mu.Lock()
+	q.tasks = append(q.tasks, &BatchTask{
+		ID:        "legacy-1",
+		Type:      TypeDownload,
+		State:     StateDone,
+		URL:       "https://x/legacy",
+		ResultDir: "/dl/legacy",
+		Files:     []string{"/dl/legacy/01.jpg"},
+	})
+	q.mu.Unlock()
+
+	cands, _, err := q.ResolveTaskAudio(context.Background(), "legacy-1")
+	if err != nil {
+		t.Fatalf("ResolveTaskAudio 出错: %v", err)
+	}
+	if len(cands) != 1 || resolveCalls != 1 {
+		t.Errorf("未探测过的历史任务应回源一次，cands=%v calls=%d", cands, resolveCalls)
+	}
+}
+
+// TestDownloadAudioUnresolvedNotMarkedChecked 候选被健康检查全部过滤时
+// 不置 AudioChecked（不代表「该帖没有 BGM」，应允许稍后重试补取）。
+func TestDownloadAudioUnresolvedNotMarkedChecked(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (DownloadResult, error) {
+		return DownloadResult{
+			Dir:     "/dl/x",
+			PostRef: "图文帖 | 100 张",
+			Files:   []string{"/dl/x/01.jpg"},
+			Audio:   nil, // 候选全部被过滤
+			// AudioResolved 保持 false：解析层拿到了候选但均不可用
+		}, nil
+	}
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	tk, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/1"})
+	waitFor(t, func() bool { return taskState(q, tk.ID) == StateDone }, "下载任务应完成")
+
+	for _, s := range q.Snapshot() {
+		if s.ID == tk.ID && s.AudioChecked {
+			t.Error("候选全部不可用时不置 AudioChecked：这不是「该帖没有 BGM」")
+		}
+	}
+}
+
+// TestResolveTaskAudioRejectsNonDownload 非下载任务与不存在的任务应报错。
+func TestResolveTaskAudioRejectsNonDownload(t *testing.T) {
+	exec := newFakeExecutor()
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	if _, _, err := q.ResolveTaskAudio(context.Background(), "不存在"); err == nil {
+		t.Error("不存在的任务应报错")
+	}
+
+	tk, _ := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/in", OutDir: "/in_out"})
+	waitFor(t, func() bool { return taskState(q, tk.ID) == StateDone }, "去水印任务应完成")
+	if _, _, err := q.ResolveTaskAudio(context.Background(), tk.ID); err == nil {
+		t.Error("去水印任务没有 BGM，应报错")
+	}
+}
+
 // TestPermanentError 确定性错误不重试直接 failed。
 func TestPermanentError(t *testing.T) {
 	exec := newFakeExecutor()
-	exec.dlFn = func(ctx context.Context, t *BatchTask) (string, string, []string, error) {
-		return "", "", nil, Permanent(errors.New("该链接是视频内容，暂不支持"))
+	exec.dlFn = func(ctx context.Context, t *BatchTask) (DownloadResult, error) {
+		return DownloadResult{}, Permanent(errors.New("该链接是视频内容，暂不支持"))
 	}
 	q := newTestQueue(exec)
 	defer q.Stop()
@@ -579,6 +778,134 @@ func TestRemoveAndClearFinished(t *testing.T) {
 	}
 }
 
+// TestSnapshotSortedNewestFirst 快照按创建时刻倒序（前端分组展示依赖此顺序）。
+func TestSnapshotSortedNewestFirst(t *testing.T) {
+	exec := newFakeExecutor()
+	// 串行执行：逐个入队并等完成，确保三条任务的 createdAt 严格递增
+	exec.mu.Lock()
+	exec.dlFn = func(ctx context.Context, task *BatchTask) (DownloadResult, error) {
+		return DownloadResult{Dir: "/dl", PostRef: "p"}, nil
+	}
+	exec.mu.Unlock()
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	var ids []string
+	for i := 0; i < 3; i++ {
+		tk, err := q.Enqueue(&BatchTask{Type: TypeDownload, URL: fmt.Sprintf("https://x/%d", i)})
+		if err != nil {
+			t.Fatalf("入队失败: %v", err)
+		}
+		ids = append(ids, tk.ID)
+		waitFor(t, func() bool { return taskState(q, tk.ID) == StateDone }, "任务未完成")
+		time.Sleep(2 * time.Millisecond) // 拉开 createdAt，避免同刻导致顺序不可判
+	}
+
+	snap := q.Snapshot()
+	if len(snap) != 3 {
+		t.Fatalf("快照应有 3 条，实际 %d", len(snap))
+	}
+	for i := 0; i < len(snap)-1; i++ {
+		if snap[i].CreatedAt.Before(snap[i+1].CreatedAt) {
+			t.Errorf("快照应按创建时刻倒序：第 %d 条(%v) 早于第 %d 条(%v)",
+				i, snap[i].CreatedAt, i+1, snap[i+1].CreatedAt)
+		}
+	}
+	// 最新的任务应排在最前
+	if snap[0].ID != ids[2] {
+		t.Errorf("首条应为最后入队的任务，实际 %s（期望 %s）", snap[0].ID, ids[2])
+	}
+}
+
+// TestTaskTimeUsesFinishedForTerminal 分组判据时刻：终态取完成时刻，其余取创建时刻。
+func TestTaskTimeUsesFinishedForTerminal(t *testing.T) {
+	created := time.Now().Add(-48 * time.Hour)
+	finished := time.Now().Add(-1 * time.Hour)
+
+	done := &BatchTask{State: StateDone, CreatedAt: created, FinishedAt: &finished}
+	if got := TaskTime(done); !got.Equal(finished) {
+		t.Errorf("终态应用完成时刻，实际 %v", got)
+	}
+	// 终态但无完成时刻（历史数据）：退回创建时刻，不能返回零值把任务归到「很久以前」
+	doneNoFin := &BatchTask{State: StateDone, CreatedAt: created}
+	if got := TaskTime(doneNoFin); !got.Equal(created) {
+		t.Errorf("终态缺完成时刻应退回创建时刻，实际 %v", got)
+	}
+	for _, st := range []string{StatePending, StateRunning, StateRetryWait} {
+		tk := &BatchTask{State: st, CreatedAt: created, FinishedAt: &finished}
+		if got := TaskTime(tk); !got.Equal(created) {
+			t.Errorf("状态 %s 应用创建时刻，实际 %v", st, got)
+		}
+	}
+}
+
+// TestClearFinishedFilteredByRange 按时间区间清空：只删区间内的终态任务，
+// 永不删除非终态任务。
+func TestClearFinishedFilteredByRange(t *testing.T) {
+	exec := newFakeExecutor()
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	dl, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/a"})
+	ip, _ := q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/a", OutDir: "/a_out"})
+	waitFor(t, func() bool { return taskState(q, dl.ID) == StateDone && taskState(q, ip.ID) == StateDone }, "任务未完成")
+
+	// 区间覆盖「过去 1 小时」→ 两条终态任务都在区间内；限定 download 类型
+	now := time.Now()
+	q.ClearFinishedFiltered(ClearFilter{Type: TypeDownload, Since: now.Add(-time.Hour), Until: now.Add(time.Hour)})
+	for _, s := range q.Snapshot() {
+		if s.ID == dl.ID {
+			t.Error("区间内的 download 终态任务应被清空")
+		}
+	}
+	if taskState(q, ip.ID) != StateDone {
+		t.Error("类型不匹配的 inpaint 任务不应被清空")
+	}
+
+	// 区间落在「未来」→ 无任务命中，全部保留
+	q.ClearFinishedFiltered(ClearFilter{Since: now.Add(time.Hour)})
+	if n := len(q.Snapshot()); n != 1 {
+		t.Errorf("未来区间不应清掉任何任务，剩余应为 1，实际 %d", n)
+	}
+
+	// 不限区间 + 不限类型 → 清空全部终态
+	q.ClearFinishedFiltered(ClearFilter{})
+	if n := len(q.Snapshot()); n != 0 {
+		t.Errorf("清空全部后应剩 0 条，实际 %d", n)
+	}
+}
+
+// TestClearGroupNeverRemovesActive 硬约束：任何筛选条件都不能删除非终态任务。
+func TestClearGroupNeverRemovesActive(t *testing.T) {
+	exec := newFakeExecutor()
+	block := make(chan struct{})
+	exec.mu.Lock()
+	exec.dlFn = func(ctx context.Context, task *BatchTask) (DownloadResult, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return DownloadResult{}, ctx.Err()
+		}
+		return DownloadResult{Dir: "/dl"}, nil
+	}
+	exec.mu.Unlock()
+	q := newTestQueue(exec)
+	defer q.Stop()
+	defer close(block)
+
+	running, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/run"})
+	waitFor(t, func() bool { return taskState(q, running.ID) == StateRunning }, "任务未进入执行中")
+
+	// 即使筛选条件覆盖全部时间、不限类型，执行中的任务也必须留下
+	q.ClearFinishedFiltered(ClearFilter{})
+	if taskState(q, running.ID) != StateRunning {
+		t.Error("执行中的任务绝不应被清空操作删除")
+	}
+	if n := len(q.Snapshot()); n != 1 {
+		t.Errorf("执行中任务应保留，剩余应为 1，实际 %d", n)
+	}
+}
+
 // TestNormalizeURL 链接规范化比较。
 func TestNormalizeURL(t *testing.T) {
 	cases := [][2]string{
@@ -621,4 +948,89 @@ func TestLoadQueueMissingFile(t *testing.T) {
 	if len(tasks) != 0 {
 		t.Errorf("应返回空列表，实际 %d", len(tasks))
 	}
+}
+
+// TestWouldClearMatchesActual 预演（WouldClear）与实际清空必须严格一致。
+//
+// 上层要在删记录前先用 WouldClear 收集文件路径，若两者判据漂移，
+// 就会出现「预演说会删、实际没删」或反之——后者会删掉仍被引用的文件。
+func TestWouldClearMatchesActual(t *testing.T) {
+	exec := newFakeExecutor()
+	block := make(chan struct{})
+	// inpaint 阻塞在途 → 制造一条「非终态」任务，用于验证它永不被牵连
+	exec.ipFn = func(ctx context.Context, t *BatchTask) (InpaintResult, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return InpaintResult{}, ctx.Err()
+	}
+	q := newTestQueue(exec)
+	defer func() {
+		close(block)
+		q.Stop()
+	}()
+
+	q.Enqueue(&BatchTask{Type: TypeInpaint, InDir: "/slow", OutDir: "/slow_out"})
+	<-exec.started // 该 inpaint 已进入 running，处于非终态
+
+	dl, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/a"})
+	waitFor(t, func() bool { return taskState(q, dl.ID) == StateDone }, "download 任务未完成")
+
+	// 只清 download 类型：预演应只含那一条 download
+	f := ClearFilter{Type: TypeDownload}
+	predicted := q.WouldClear(f)
+	if len(predicted) != 1 || predicted[0].ID != dl.ID {
+		t.Fatalf("预演应只含 download 终态任务，实际 %v", ids(predicted))
+	}
+
+	before := len(q.Snapshot())
+	q.ClearFinishedFiltered(f)
+	after := len(q.Snapshot())
+
+	if after != before-len(predicted) {
+		t.Errorf("实际删除数应与预演一致：before=%d after=%d predicted=%d",
+			before, after, len(predicted))
+	}
+	// 非终态任务在任何筛选下都必须存活
+	for _, s := range q.Snapshot() {
+		if s.Type == TypeInpaint && s.ID != dl.ID && terminalState(s.State) {
+			t.Errorf("在途 inpaint 任务不应被清空，实际 state=%s", s.State)
+		}
+	}
+	if n := len(q.Snapshot()); n != 1 {
+		t.Errorf("应仅剩在途的 inpaint 任务，实际 %d 条", n)
+	}
+
+	// 不限条件的预演必须跳过非终态
+	if got := len(q.WouldClear(ClearFilter{})); got != 0 {
+		t.Errorf("非终态任务不应被预演为可清空，实际 %d", got)
+	}
+}
+
+// TestWouldClearDoesNotMutate WouldClear 是纯查询，调用后任务数不变。
+func TestWouldClearDoesNotMutate(t *testing.T) {
+	exec := newFakeExecutor()
+	q := newTestQueue(exec)
+	defer q.Stop()
+
+	dl, _ := q.Enqueue(&BatchTask{Type: TypeDownload, URL: "https://x/a"})
+	waitFor(t, func() bool { return taskState(q, dl.ID) == StateDone }, "任务未完成")
+
+	before := len(q.Snapshot())
+	twice := len(q.WouldClear(ClearFilter{}))
+	if got := len(q.Snapshot()); got != before {
+		t.Errorf("WouldClear 不应改变任务数：before=%d after=%d", before, got)
+	}
+	if twice != 1 {
+		t.Errorf("应预演出 1 条，实际 %d", twice)
+	}
+}
+
+func ids(ts []BatchTask) []string {
+	out := make([]string, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.ID)
+	}
+	return out
 }

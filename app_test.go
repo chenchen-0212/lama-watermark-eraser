@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -14,6 +15,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"lama-watermark-eraser/internal/downloader"
+	"lama-watermark-eraser/internal/queue"
 )
 
 // writeTestPNG 写一张 8x8 纯色 PNG 作为测试夹具。
@@ -320,6 +325,70 @@ func TestGetBGMAudioRejectsHTML(t *testing.T) {
 	}
 }
 
+// TestBGMAudioCacheHitOnCDNDrift CDN 每次下发的地址都带新的签名/时效参数，
+// 缓存键取候选链的路径签名（而非完整 URL），因此地址漂移后仍应命中缓存。
+func TestBGMAudioCacheHitOnCDNDrift(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+
+	var hits int32
+	payload := []byte("ID3\x03\x00cached-audio-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	a := &App{}
+	base := srv.URL + "/obj/ies-music/7286.mp3"
+	if _, err := a.GetBGMAudio([]string{base + "?x-expires=1&sign=aa"}, ""); err != nil {
+		t.Fatalf("首次取音频: %v", err)
+	}
+	if _, err := a.GetBGMAudio([]string{base + "?x-expires=999&sign=zz"}, ""); err != nil {
+		t.Fatalf("二次取音频: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("签名漂移后应命中缓存（仅 1 次请求），实际 %d 次", n)
+	}
+}
+
+// TestBGMAudioCacheKeyUsesMusicID 登记了 music_id 的候选链，即使各级候选的文件
+// 路径完全不同（SSR 与 detail 接口常下发不同的对象存储路径），也应落到同一个
+// 试听缓存——同一首 BGM 不该被重复下载。
+func TestBGMAudioCacheKeyUsesMusicID(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+
+	var hits int32
+	payload := []byte("ID3\x03\x00music-id-cache-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	const musicID = "7286820160101201977"
+	ssr := []string{srv.URL + "/obj/ies-music/7286.mp3?sign=aa"}
+	detail := []string{srv.URL + "/obj/tos-cn-ve-2774/other-file?sign=bb"}
+	downloader.RegisterAudioChain(ssr, []downloader.AudioCandidate{
+		{URL: ssr[0], Source: downloader.SourceDouyinSSRURLList},
+	}, musicID)
+	downloader.RegisterAudioChain(detail, []downloader.AudioCandidate{
+		{URL: detail[0], Source: downloader.SourceDouyinMusicDetail},
+	}, musicID)
+
+	a := &App{}
+	if _, err := a.GetBGMAudio(ssr, ""); err != nil {
+		t.Fatalf("首次取音频: %v", err)
+	}
+	if _, err := a.GetBGMAudio(detail, ""); err != nil {
+		t.Fatalf("二次取音频: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("同一 music_id 的不同候选链应共用缓存（仅 1 次请求），实际 %d 次", n)
+	}
+}
+
 // TestGetAppVersion 版本号注入行为：
 //   - 未注入（go test / go run 场景）必须回退为 "dev"，不能返回空串——
 //     前端据此决定是否显示版本标注，空串与「未注入」在语义上要区分开；
@@ -340,4 +409,315 @@ func TestGetAppVersion(t *testing.T) {
 	if got := (&App{}).GetAppVersion(); got != "1.1.6" {
 		t.Errorf("注入后应原样返回，实际 %q", got)
 	}
+}
+
+// TestInstallDirAndQueuePath 安装目录与任务数据路径位于 <安装目录>/dataList。
+func TestInstallDirAndQueuePath(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("取不到测试可执行文件路径: %v", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	if got, want := installDir(), filepath.Dir(exe); got != want {
+		t.Errorf("installDir 应为 exe 所在目录\n got=%s\nwant=%s", got, want)
+	}
+	if got, want := queueFilePath(), filepath.Join(filepath.Dir(exe), "dataList", "queue.json"); got != want {
+		t.Errorf("任务数据路径错误\n got=%s\nwant=%s", got, want)
+	}
+}
+
+// TestMigrateLegacyQueue 旧位置的任务数据应被一次性迁移到新位置；
+// 新位置已有数据时不覆盖，避免把用户当前任务冲掉。
+func TestMigrateLegacyQueue(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "queue.json")
+
+	// 旧文件存在 + 新文件不存在 → 迁移并删除旧文件
+	old := filepath.Join(src, "queue.json")
+	content := []byte(`{"version":1,"tasks":[{"id":"legacy-1","type":"download","state":"done"}]}`)
+	if err := os.WriteFile(old, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateLegacyQueueFrom(old, dst); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("迁移后新位置应有数据: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("迁移内容不一致\n got=%s\nwant=%s", got, content)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("迁移成功后旧文件应被删除（否则新位置清空后旧任务会复活）")
+	}
+
+	// 新文件已存在 → 不迁移、不覆盖
+	fresh := []byte(`{"version":1,"tasks":[{"id":"cur-1"}]}`)
+	if err := os.WriteFile(dst, fresh, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateLegacyQueueFrom(old, dst); err != nil {
+		t.Fatalf("已有数据时迁移应静默跳过: %v", err)
+	}
+	got, _ = os.ReadFile(dst)
+	if string(got) != string(fresh) {
+		t.Errorf("新位置已有数据时不应被覆盖\n got=%s", got)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Error("跳过迁移时旧文件应保持原样")
+	}
+
+	// 旧文件不存在 → 全新安装，静默返回
+	if err := migrateLegacyQueueFrom(filepath.Join(src, "nope.json"), dst); err != nil {
+		t.Errorf("旧文件缺失时应静默返回，实际 %v", err)
+	}
+}
+
+// ---------------------------------------------------------- 缓存清理
+
+// mkFiles 在目录下批量创建指定大小的文件，返回总字节数与文件数。
+func mkFiles(t *testing.T, dir string, sizes ...int) (int64, int) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for i, n := range sizes {
+		p := filepath.Join(dir, fmt.Sprintf("f%d.bin", i))
+		if err := os.WriteFile(p, bytes.Repeat([]byte("x"), n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		total += int64(n)
+	}
+	return total, len(sizes)
+}
+
+// TestIsReferenced 引用判定必须同时覆盖「目录包含文件」与「文件反查目录」
+// 两个方向——漏掉任何一侧都会误删仍在使用中的素材。
+func TestIsReferenced(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "downloads", "douyin", "abc")
+	file := filepath.Join(dir, "01.webp")
+	other := filepath.Join(root, "downloads", "douyin", "zzz", "01.webp")
+
+	used := []string{dir} // 任务记录里存的是目录
+	if !isReferenced(used, dir) {
+		t.Error("目录自身应视为被引用")
+	}
+	if !isReferenced(used, file) {
+		t.Error("目录内的文件应视为被引用（否则会被整目录清掉）")
+	}
+	if isReferenced(used, other) {
+		t.Error("兄弟目录不应被视为被引用")
+	}
+
+	// 反向：记录里存的是文件，其所在目录也不该被整目录删除
+	usedFile := []string{file}
+	if !isReferenced(usedFile, dir) {
+		t.Error("被引用文件所在目录不应被视为可释放")
+	}
+
+	// 大小写不敏感（Windows 语义）：盘符/目录名大小写不同不能造成误判
+	upper := strings.ToUpper(filepath.ToSlash(dir))
+	if !isReferenced(used, filepath.FromSlash(upper)) {
+		t.Error("路径比较应忽略大小写，避免大小写差异导致误删")
+	}
+}
+
+// TestClearWorkspaceCacheKeepsReferenced 核心安全约束：被任务记录引用的
+// 目录与文件必须原样保留，只有「无记录指向」的旧素材才被清掉。
+func TestClearWorkspaceCacheKeepsReferenced(t *testing.T) {
+	root := t.TempDir()
+	keptDir := filepath.Join(root, "downloads", "douyin", "keep-me")
+	keptSize, _ := mkFiles(t, keptDir, 100, 200)
+	junkDir := filepath.Join(root, "downloads", "douyin", "old-junk")
+	junkSize, _ := mkFiles(t, junkDir, 300, 400)
+	// 顶层散落的旧 zip（导出遗留）
+	zipPath := filepath.Join(root, "去水印结果_20260901_000000.zip")
+	if err := os.WriteFile(zipPath, bytes.Repeat([]byte("z"), 500), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := newCacheTestApp([]string{keptDir})
+	payload, err := a.clearWorkspaceCacheAt(root)
+	if err != nil {
+		t.Fatalf("清除失败: %v", err)
+	}
+
+	if _, err := os.Stat(keptDir); err != nil {
+		t.Fatalf("被任务记录引用的目录必须保留: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(keptDir, "f0.bin")); err != nil {
+		t.Error("被引用目录内的文件必须保留")
+	}
+	if _, err := os.Stat(junkDir); !os.IsNotExist(err) {
+		t.Error("未被引用的目录应被删除")
+	}
+	if _, err := os.Stat(zipPath); !os.IsNotExist(err) {
+		t.Error("未被引用的顶层 zip 应被删除")
+	}
+
+	wantFreed := junkSize + 500
+	if payload.FreedBytes != int64(wantFreed) {
+		t.Errorf("释放字节数不符\n got=%d\nwant=%d", payload.FreedBytes, wantFreed)
+	}
+	if payload.Kept <= 0 {
+		t.Error("应报告有受保护的条目")
+	}
+	if payload.Nothing {
+		t.Error("确实清掉了文件，不应标记 Nothing")
+	}
+	_ = keptSize
+}
+
+// TestClearWorkspaceCachePartialDir 目录被部分引用时，只清内部未被引用的子项，
+// 目录自身与已引用文件保留。
+func TestClearWorkspaceCachePartialDir(t *testing.T) {
+	root := t.TempDir()
+	plat := filepath.Join(root, "downloads", "douyin")
+	keep := filepath.Join(plat, "keep")
+	drop := filepath.Join(plat, "drop")
+	mkFiles(t, keep, 111)
+	mkFiles(t, drop, 222)
+
+	a := newCacheTestApp([]string{keep})
+	if _, err := a.clearWorkspaceCacheAt(root); err != nil {
+		t.Fatalf("清除失败: %v", err)
+	}
+
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("被引用的子目录应保留")
+	}
+	if _, err := os.Stat(drop); !os.IsNotExist(err) {
+		t.Error("同层未被引用的子目录应被删除")
+	}
+	// 容器目录 download/douyin 本身未被任何记录引用，但其内部仍有
+	// 被引用的 keep/，故不能让「删掉容器」波及 keep——要么容器保留，
+	// 要么容器被删但 keep 必须还在（keep 已在上面断言）。
+	_ = plat
+}
+
+// TestClearWorkspaceCacheNothing 无可释放空间时应返回 Nothing，且不报错——
+// 前端据此提示「已是干净状态」而不是「已清除 0 B」。
+func TestClearWorkspaceCacheNothing(t *testing.T) {
+	root := t.TempDir()
+	keep := filepath.Join(root, "downloads", "xhs", "only")
+	mkFiles(t, keep, 64)
+
+	a := newCacheTestApp([]string{keep})
+	payload, err := a.clearWorkspaceCacheAt(root)
+	if err != nil {
+		t.Fatalf("无可清理内容时不应报错: %v", err)
+	}
+	if !payload.Nothing {
+		t.Error("无可释放空间时应标记 Nothing")
+	}
+	if payload.FreedBytes != 0 {
+		t.Errorf("不应报告释放空间，实际 %d", payload.FreedBytes)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("唯一目录被引用，应原样保留")
+	}
+}
+
+// TestClearWorkspaceCacheMissingDir 目录不存在时静默返回 Nothing，不报错。
+func TestClearWorkspaceCacheMissingDir(t *testing.T) {
+	a := newCacheTestApp(nil)
+	payload, err := a.clearWorkspaceCacheAt(filepath.Join(t.TempDir(), "not-created"))
+	if err != nil {
+		t.Fatalf("目录不存在不应报错: %v", err)
+	}
+	if !payload.Nothing {
+		t.Error("目录不存在应标记 Nothing")
+	}
+}
+
+// TestGetCacheUsageAt 用量统计：可释放 / 受保护两侧都要算准。
+func TestGetCacheUsageAt(t *testing.T) {
+	root := t.TempDir()
+	keep := filepath.Join(root, "downloads", "wechat", "k")
+	keepTotal, keepN := mkFiles(t, keep, 1000, 1000)
+	junk := filepath.Join(root, "selected", "20260901_000000")
+	junkTotal, junkN := mkFiles(t, junk, 250, 250)
+
+	a := newCacheTestApp([]string{keep})
+	u := a.getCacheUsageAt(root)
+
+	if u.TotalBytes != keepTotal+junkTotal {
+		t.Errorf("总占用不符\n got=%d\nwant=%d", u.TotalBytes, keepTotal+junkTotal)
+	}
+	if u.FreeBytes != junkTotal {
+		t.Errorf("可释放不符\n got=%d\nwant=%d", u.FreeBytes, junkTotal)
+	}
+	if u.KeptBytes != keepTotal {
+		t.Errorf("受保护不符\n got=%d\nwant=%d", u.KeptBytes, keepTotal)
+	}
+	if u.KeptDir != 1 {
+		t.Errorf("受保护目录数应为 1，实际 %d", u.KeptDir)
+	}
+	_ = keepN
+	_ = junkN
+}
+
+// TestRemovePathsUnderStaysInsideRoot 边界约束：只删 root 之内、且不允许删 root 本身。
+// 记录可能被手改指向工作区外的目录，越界删除会误伤用户文件。
+func TestRemovePathsUnderStaysInsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	// 工作区内
+	inside := filepath.Join(root, "downloads", "a")
+	mkFiles(t, inside, 128)
+	// 工作区外（同级的另一个目录，前缀相同但不是子路径）
+	outFile := filepath.Join(outside, "keep.bin")
+	if err := os.WriteFile(outFile, []byte("important"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	freed, n := removePathsUnder(root, []string{inside, outFile, root})
+	if freed <= 0 || n <= 0 {
+		t.Errorf("应删除工作区内的目录，实际 freed=%d n=%d", freed, n)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("工作区外的目录绝不能被删除: %v", err)
+	}
+	if _, err := os.Stat(outFile); err != nil {
+		t.Error("工作区外的文件绝不能被删除")
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatal("root 自身绝不能被删除")
+	}
+}
+
+// newCacheTestApp 构造仅带「被引用路径」的 App，供缓存清理用例使用。
+func newCacheTestApp(referenced []string) *App {
+	if len(referenced) == 0 {
+		return &App{}
+	}
+	now := time.Now()
+	tasks := make([]queue.BatchTask, 0, len(referenced))
+	for i, p := range referenced {
+		tasks = append(tasks, queue.BatchTask{
+			ID:        fmt.Sprintf("t-%d", i),
+			Type:      queue.TypeDownload,
+			State:     queue.StateDone,
+			ResultDir: p,
+			FinishedAt: &now,
+		})
+	}
+	return &App{q: queue.NewWithTasks(tasks, "")}
+}
+
+// taskIDs 提取任务 ID 列表（测试断言用）。
+func taskIDs(ts []queue.BatchTask) []string {
+	out := make([]string, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.ID)
+	}
+	return out
 }

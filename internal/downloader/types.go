@@ -23,8 +23,9 @@ type Post struct {
 	AudioCandidates []string `json:"audioCandidates,omitempty"`
 }
 
-// SetAudio 统一设置 BGM 取源：首项写入 AudioURL 保持兼容，全量写入 AudioCandidates。
-// 入参会做 trim、去空、去重（保序）。
+// SetAudio 设置 BGM 取源（仅地址，无来源信息）。
+// 首项写入 AudioURL 保持兼容，全量写入 AudioCandidates。
+// 入参会做 trim、去空、去重（保序）。新代码应优先用 SetAudioCandidates。
 func (p *Post) SetAudio(name string, urls ...string) {
 	p.AudioName = name
 	seen := make(map[string]bool, len(urls))
@@ -43,6 +44,28 @@ func (p *Post) SetAudio(name string, urls ...string) {
 	} else {
 		p.AudioURL = ""
 	}
+	registerAudioChain(out, "", nil)
+}
+
+// SetAudioCandidates 设置带来源信息的 BGM 候选链（抖音 / 小红书统一走这里）。
+//
+// 对外仍只暴露 []string——AudioCandidates 是前端既有契约，不能改成对象数组，
+// 否则前端的候选链校验会失效。候选链同时登记到进程内注册表：下载时前端只回传
+// 地址列表，来源信息无法随参数往返，只能靠注册表恢复，供日志与排序使用。
+func (p *Post) SetAudioCandidates(name, musicID string, cands ...AudioCandidate) {
+	deduped := DedupCandidates(cands)
+	urls := make([]string, 0, len(deduped))
+	for _, c := range deduped {
+		urls = append(urls, c.URL)
+	}
+	p.AudioName = name
+	p.AudioCandidates = urls
+	if len(urls) > 0 {
+		p.AudioURL = urls[0]
+	} else {
+		p.AudioURL = ""
+	}
+	registerAudioChain(urls, musicID, deduped)
 }
 
 var (

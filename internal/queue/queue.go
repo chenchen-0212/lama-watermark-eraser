@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,17 @@ type BatchTask struct {
 	Summary  string   `json:"summary,omitempty"`  // inpaint：成功 x / 失败 y / 跳过 z
 	FailList []string `json:"failList,omitempty"` // inpaint：失败文件清单（文件名 + 原因）
 
+	// 下载任务的 BGM 取源（方案 v1.2）：自动入队后「去框选」只能凭任务记录还原
+	// 帖子上下文，帖子自带的 BGM 若不随任务落库就会在框选页彻底丢失——用户看到
+	// 的「界面上不出现 BGM 下载按钮」正是此因。
+	// 三个字段与 downloader.Post 的前端契约同名同义，前端可直接平铺还原。
+	AudioURL        string   `json:"audioUrl,omitempty"`        // 首选音频地址（=候选链首项）
+	AudioCandidates []string `json:"audioCandidates,omitempty"` // 候选链（按优先级，逐条尝试）
+	AudioName       string   `json:"audioName,omitempty"`       // 平台曲目名（展示/命名参考）
+	// AudioChecked 本轮是否已真正探测过 BGM（含「确认无 BGM」）。
+	// 用于区分「确实没有 BGM」与「历史任务未曾探测」：前者不再补取，后者按需回源。
+	AudioChecked bool `json:"audioChecked,omitempty"`
+
 	Progress    *TaskProgress `json:"progress,omitempty"`    // 运行中进度（不持久化）
 	NextRetryAt *time.Time    `json:"nextRetryAt,omitempty"` // retry_wait 的预计重试时刻
 }
@@ -143,6 +155,23 @@ type InpaintResult struct {
 	OK       int      `json:"ok"`
 	Total    int      `json:"total"`
 	FailList []string `json:"failList,omitempty"` // "name: info"
+}
+
+// DownloadResult 下载任务执行结果。
+//
+// 不复用返回值列表（曾为 (resultDir, postRef, files, err)）而改为结构体：BGM
+// 取源字段与图片清单同源产出、必须一同回填，返回值列表再加字段易错位。
+type DownloadResult struct {
+	Dir      string   // 素材目录
+	PostRef  string   // 展示摘要（标题 | 张数）
+	Files    []string // 本次下载的图片清单（按序）
+	AudioURL string   // BGM 首选地址（无则空）
+	Audio    []string // BGM 候选链（按优先级；可能为空）
+	AudioNm  string   // BGM 曲目名
+	// AudioResolved 本轮是否真正解析过帖子的 BGM 字段。
+	// 用于区分两种「候选链为空」：帖子本身没有 BGM（true，无需再补取），
+	// 与候选地址被健康检查过滤干净（false，可稍后重试补取）。
+	AudioResolved bool
 }
 
 // EnqueueFailure 批量入队时单条链接的失败记录（PRD §4.2：失败原因即时反馈）。
@@ -162,12 +191,14 @@ type ProgressFn func(i, total int, name, status, info string)
 
 // Executor 队列任务的执行器（由 app.go 实现，复用既有下载/推理链路）。
 type Executor interface {
-	// RunDownload 执行下载任务，返回素材目录、展示摘要（标题/张数）与
-	// 本次下载的图片清单（按序）。
-	RunDownload(ctx context.Context, t *BatchTask) (resultDir, postRef string, files []string, err error)
+	// RunDownload 执行下载任务，返回素材目录、展示摘要、图片清单与 BGM 取源。
+	RunDownload(ctx context.Context, t *BatchTask) (DownloadResult, error)
 	// RunInpaint 执行去水印任务，返回结果汇总。部分单张失败不视为任务错误
 	// （结果经 InpaintResult 传达）；err 非 nil 表示任务级失败。
 	RunInpaint(ctx context.Context, t *BatchTask, onProgress ProgressFn) (InpaintResult, error)
+	// ResolveTaskAudio 回源补取历史下载任务的 BGM（该任务入队时尚无 BGM 落库能力）。
+	// 返回候选链与曲目名；未找到 BGM 时返回空链且 err 为 nil。
+	ResolveTaskAudio(ctx context.Context, t *BatchTask) (cands []string, name string, err error)
 }
 
 // Notifier 事件回调：event 为 Wails 事件名，payload 为随事件发送的载荷。
@@ -197,6 +228,21 @@ type Queue struct {
 }
 
 // New 构造队列。path 为空时不持久化；notify 可为 nil。
+// NewWithTasks 用既有任务列表构造队列（不启动 worker），仅供测试夹具使用。
+//
+// Enqueue 会把任务重置为 pending，无法用来灌入「已完成/已失败」的记录；
+// 缓存清理等逻辑需要终态任务才能验证，故提供该直通构造器。
+func NewWithTasks(tasks []BatchTask, path string) *Queue {
+	q := New(nil, nil, path)
+	q.mu.Lock()
+	for i := range tasks {
+		t := tasks[i]
+		q.tasks = append(q.tasks, &t)
+	}
+	q.mu.Unlock()
+	return q
+}
+
 func New(exec Executor, notify Notifier, path string) *Queue {
 	return &Queue{
 		exec:        exec,
@@ -436,16 +482,89 @@ func (q *Queue) Remove(id string) error {
 	return nil
 }
 
-// ClearFinished 清空终态任务记录。taskType 为空清全部；否则仅清该类型
-// （download | inpaint）——前端两类队列独立管理（问题修复 #1）。
+// ClearFilter 清空筛选条件：按任务类型 + 时间区间定位要清除的终态任务。
+//
+// 空值语义（可自由组合）：
+//   - Type 为空     → 不限类型（download / inpaint 都清）；
+//   - Since 为零值  → 不限起始时间；
+//   - Until 为零值  → 不限结束时间。
+//
+// 仅终态（done/failed/canceled）可被清除：这是硬约束，任何筛选条件都不能
+// 删掉排队中/执行中的任务——否则用户点「清空」会静默丢掉正在跑的任务。
+// 时间比较用**任务时刻**（见 TaskTime），与前端分组口径完全一致，
+// 保证「界面上看到某组有几条」与「清空该组删了几条」两件事不会打架。
+type ClearFilter struct {
+	Type  string
+	Since time.Time
+	Until time.Time
+}
+
+// TaskTime 返回任务归属分组的判据时刻：终态用完成时刻，其余用创建时刻。
+//
+// 与前端 App.vue 的 taskTime 语义严格对齐（终态显示完成时刻、运行中显示
+// 已执行时长、排队中显示创建时刻）——分组与卡片时间必须同一口径，
+// 否则会出现「卡片写着昨天、却分在今天的组里」。
+func TaskTime(t *BatchTask) time.Time {
+	if terminalState(t.State) && t.FinishedAt != nil {
+		return *t.FinishedAt
+	}
+	return t.CreatedAt
+}
+
+// ClearFinished 清空终态任务记录（兼容旧签名）。taskType 为空清全部；
+// 否则仅清该类型（download | inpaint）——前端两类队列独立管理。
 func (q *Queue) ClearFinished(taskType string) {
+	q.ClearFinishedFiltered(ClearFilter{Type: taskType})
+}
+
+// matchedForClear 判断任务是否会被该筛选条件清除（纯判断，不改状态）。
+//
+// 与 ClearFinishedFiltered 共用同一套判据，避免两处逻辑漂移——预演结果
+// 与实际删除结果必须严格一致，否则会误删「本来会保留」的任务文件。
+func matchedForClear(t *BatchTask, f ClearFilter) bool {
+	if !terminalState(t.State) {
+		return false // 非终态永不删除
+	}
+	if f.Type != "" && t.Type != f.Type {
+		return false
+	}
+	if !f.Since.IsZero() || !f.Until.IsZero() {
+		at := TaskTime(t)
+		if !f.Since.IsZero() && at.Before(f.Since) {
+			return false
+		}
+		if !f.Until.IsZero() && !at.Before(f.Until) {
+			return false // 左闭右开
+		}
+	}
+	return true
+}
+
+// WouldClear 返回该筛选条件下将被清除的任务快照（不修改任何状态）。
+//
+// 供上层在真正清空前收集这些任务引用的本地文件路径——先算后删，
+// 避免「记录已删、文件列表拿不到」的时序问题。
+func (q *Queue) WouldClear(f ClearFilter) []BatchTask {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []BatchTask
+	for _, t := range q.tasks {
+		if matchedForClear(t, f) {
+			out = append(out, *t)
+		}
+	}
+	return out
+}
+
+// ClearFinishedFiltered 按筛选条件清空终态任务记录。
+func (q *Queue) ClearFinishedFiltered(f ClearFilter) {
 	q.mu.Lock()
 	keep := q.tasks[:0]
 	for _, t := range q.tasks {
-		if terminalState(t.State) && (taskType == "" || t.Type == taskType) {
-			continue // 终态且类型匹配 → 移除
+		if !matchedForClear(t, f) {
+			keep = append(keep, t) // 不匹配（含非终态）一律保留
 		}
-		keep = append(keep, t)
+		// 匹配 → 移除
 	}
 	q.tasks = keep
 	q.mu.Unlock()
@@ -472,6 +591,13 @@ func normalizeURL(u string) string {
 }
 
 // Snapshot 返回任务列表快照（值拷贝，调用方修改不影响队列内部状态）。
+//
+// 排序：按创建时刻**倒序**（最新在前）。前端按时间分组展示，分组内顺序
+// 直接沿用本顺序（新→旧），无需再排一次。队列内部仍保持「入队先后」的
+// 原始顺序——nextPendingByType 取最早 pending 依赖该顺序（FIFO），故只在
+// 快照这一层排序，不动 q.tasks 本体。
+//
+// 同刻创建（同毫秒入队的批量链接）用 ID 兜底比较，保证顺序稳定可复现。
 func (q *Queue) Snapshot() []BatchTask {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -479,10 +605,67 @@ func (q *Queue) Snapshot() []BatchTask {
 	for i, t := range q.tasks {
 		out[i] = *t
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
 	return out
 }
 
 // ---------------------------------------------------------- 内部实现
+
+// ResolveTaskAudio 回源补取指定下载任务的 BGM 并写回任务记录。
+//
+// 存在的意义：BGM 取源字段是随本次改造新增的，此前完成的任务（以及由旧版本
+// 持久化文件恢复的任务）没有 BGM 数据，前端「去框选」时无从还原帖子上下文。
+// 本方法按需重新解析该任务的链接并把结果落库——同一任务只补取一次
+// （AudioChecked 置位），失败不影响下载内容，重试由前端触发。
+//
+// 返回该任务的候选链与曲目名；无 BGM 时返回空链且 err == nil。
+func (q *Queue) ResolveTaskAudio(ctx context.Context, id string) ([]string, string, error) {
+	q.mu.Lock()
+	t := q.byIDLocked(id)
+	if t == nil {
+		q.mu.Unlock()
+		return nil, "", fmt.Errorf("任务不存在")
+	}
+	if t.Type != TypeDownload {
+		q.mu.Unlock()
+		return nil, "", fmt.Errorf("仅下载任务有 BGM")
+	}
+	if t.AudioChecked {
+		cands, name := t.AudioCandidates, t.AudioName
+		q.mu.Unlock()
+		return cands, name, nil
+	}
+	q.mu.Unlock()
+
+	if q.exec == nil {
+		return nil, "", fmt.Errorf("执行器未就绪")
+	}
+	cands, name, err := q.exec.ResolveTaskAudio(ctx, t)
+	if err != nil {
+		return nil, "", err
+	}
+
+	q.mu.Lock()
+	if cur := q.byIDLocked(id); cur != nil {
+		cur.AudioCandidates = cands
+		cur.AudioName = name
+		if len(cands) > 0 {
+			cur.AudioURL = cands[0]
+		} else {
+			cur.AudioURL = ""
+		}
+		cur.AudioChecked = true
+	}
+	q.mu.Unlock()
+	q.save()
+	q.notifyUpdate()
+	return cands, name, nil
+}
 
 // byIDLocked 按 ID 查任务（须持锁）。
 func (q *Queue) byIDLocked(id string) *BatchTask {
@@ -591,14 +774,13 @@ func (q *Queue) execute(t *BatchTask) {
 	q.notifyUpdate()
 
 	var (
-		err                error
-		result             InpaintResult
-		resultDir, postRef string
-		dlFiles            []string
+		err    error
+		result InpaintResult
+		dlRes  DownloadResult
 	)
 	switch t.Type {
 	case TypeDownload:
-		resultDir, postRef, dlFiles, err = q.exec.RunDownload(taskCtx, t)
+		dlRes, err = q.exec.RunDownload(taskCtx, t)
 	case TypeInpaint:
 		onProgress := func(i, total int, name, status, info string) {
 			q.mu.Lock()
@@ -635,7 +817,20 @@ func (q *Queue) execute(t *BatchTask) {
 	t.FinishedAt = &fin
 	switch t.Type {
 	case TypeDownload:
-		t.ResultDir, t.PostRef, t.Files = resultDir, postRef, dlFiles
+		t.ResultDir, t.PostRef, t.Files = dlRes.Dir, dlRes.PostRef, dlRes.Files
+		// BGM 取源随任务落库。失败/取消时不写入（dlRes 为零值），避免用空值
+		// 把重试前的既有结果覆盖掉。
+		//
+		// AudioChecked 只在「解析出了候选链」或「本轮确实解析过帖子、只是没有
+		// BGM」时置位（后者由 dlRes.AudioResolved 标记）。仅在候选被健康检查
+		// 全部过滤掉时保持未置位——这不是「该帖没有 BGM」，而是「暂时取不到
+		// 可用地址」，应允许用户稍后重试补取。
+		if err == nil && !wasCanceled {
+			t.AudioURL, t.AudioCandidates, t.AudioName = dlRes.AudioURL, dlRes.Audio, dlRes.AudioNm
+			if len(dlRes.Audio) > 0 || dlRes.AudioResolved {
+				t.AudioChecked = true
+			}
+		}
 	case TypeInpaint:
 		if result.OutDir != "" {
 			t.ResultDir = result.OutDir

@@ -62,6 +62,42 @@ export namespace inpaint {
 
 export namespace main {
 	
+	export class CacheClearPayload {
+	    freedBytes: number;
+	    files: number;
+	    kept: number;
+	    nothing: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new CacheClearPayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.freedBytes = source["freedBytes"];
+	        this.files = source["files"];
+	        this.kept = source["kept"];
+	        this.nothing = source["nothing"];
+	    }
+	}
+	export class CacheUsagePayload {
+	    totalBytes: number;
+	    freeBytes: number;
+	    keptBytes: number;
+	    keptDir: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new CacheUsagePayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.totalBytes = source["totalBytes"];
+	        this.freeBytes = source["freeBytes"];
+	        this.keptBytes = source["keptBytes"];
+	        this.keptDir = source["keptDir"];
+	    }
+	}
 	export class TaskParams {
 	    boxes: number[][];
 	    relative: boolean;
@@ -98,6 +134,20 @@ export namespace main {
 	        this.width = source["width"];
 	        this.height = source["height"];
 	        this.thumb = source["thumb"];
+	    }
+	}
+	export class taskAudioPayload {
+	    candidates: string[];
+	    name: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new taskAudioPayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.candidates = source["candidates"];
+	        this.name = source["name"];
 	    }
 	}
 
@@ -146,6 +196,10 @@ export namespace queue {
 	    files?: string[];
 	    summary?: string;
 	    failList?: string[];
+	    audioUrl?: string;
+	    audioCandidates?: string[];
+	    audioName?: string;
+	    audioChecked?: boolean;
 	    progress?: TaskProgress;
 	    // Go type: time
 	    nextRetryAt?: any;
@@ -175,6 +229,10 @@ export namespace queue {
 	        this.files = source["files"];
 	        this.summary = source["summary"];
 	        this.failList = source["failList"];
+	        this.audioUrl = source["audioUrl"];
+	        this.audioCandidates = source["audioCandidates"];
+	        this.audioName = source["audioName"];
+	        this.audioChecked = source["audioChecked"];
 	        this.progress = this.convertValues(source["progress"], TaskProgress);
 	        this.nextRetryAt = this.convertValues(source["nextRetryAt"], null);
 	    }

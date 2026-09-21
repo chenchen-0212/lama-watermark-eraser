@@ -71,7 +71,7 @@ func TestLiveDouyinE2E(t *testing.T) {
 				return
 			}
 			bgmDir := filepath.Join(outRoot, fmt.Sprintf("bgm%d", i+1))
-			saved, err := DownloadAudioWithFallback(ctx, post.AudioCandidates, bgmDir, "bgm")
+			saved, err := DownloadAudioWithFallback(ctx, CandidatesFromURLs(post.AudioCandidates), bgmDir, "bgm")
 			if err != nil {
 				bgmFail++
 				t.Errorf("BGM 下载失败（候选 %d 条）: %v", len(post.AudioCandidates), err)

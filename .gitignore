@@ -2,10 +2,13 @@
 build/*
 *.exe
 
-# 发布用安装器例外（经 Git LFS 入库）
-!build/installer/
+# 发布用安装器
+# 注意：安装器（约 301 MB/个）**不入库**——GitHub 单文件硬上限 100 MB，
+# 提交后必然被拒。发布走 GitHub Release 附件上传。
+# 历史遗留：1.1.2 曾被提交进版本库，为保持历史完整不回删，
+# 但 1.1.3 及以后一律不再入库。
 build/installer/*
-!build/installer/*.exe
+!build/installer/.gitkeep
 
 # 前端依赖与构建
 node_modules/

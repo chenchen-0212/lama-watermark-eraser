@@ -18,6 +18,14 @@ export function ClearFinishedTasks(arg1) {
   return window['go']['main']['App']['ClearFinishedTasks'](arg1);
 }
 
+export function ClearGroupTasks(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ClearGroupTasks'](arg1, arg2, arg3);
+}
+
+export function ClearWorkspaceCache() {
+  return window['go']['main']['App']['ClearWorkspaceCache']();
+}
+
 export function CopyFile(arg1, arg2) {
   return window['go']['main']['App']['CopyFile'](arg1, arg2);
 }
@@ -52,6 +60,10 @@ export function GetAppVersion() {
 
 export function GetBGMAudio(arg1, arg2) {
   return window['go']['main']['App']['GetBGMAudio'](arg1, arg2);
+}
+
+export function GetCacheUsage() {
+  return window['go']['main']['App']['GetCacheUsage']();
 }
 
 export function GetDouyinCookie() {
@@ -96,6 +108,10 @@ export function PrepareSubset(arg1) {
 
 export function RemoveQueueTask(arg1) {
   return window['go']['main']['App']['RemoveQueueTask'](arg1);
+}
+
+export function ResolveTaskAudio(arg1) {
+  return window['go']['main']['App']['ResolveTaskAudio'](arg1);
 }
 
 export function RetryQueueTask(arg1) {

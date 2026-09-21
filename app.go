@@ -12,9 +12,9 @@ import (
 	"image/draw"
 	"image/jpeg"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -83,10 +83,19 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	downloader.LoadPlatformCookiePersist(appDataDir())
+	// BGM 链路日志并入既有下载事件通道：候选级的失败原因（403/404/429/超时/
+	// 非音频）由此进入前端日志面板，便于判断问题出在候选源还是请求策略。
+	downloader.SetAudioLogger(func(msg string) {
+		if a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "download:progress", map[string]string{"msg": msg})
+		}
+	})
+	// 候选源偏好落盘：跨会话记住「哪一级候选更可靠」，下次优先尝试。
+	downloader.InitAudioPreferences(appDataDir())
 
-	// 批处理任务队列（PRD §3）：任务持久化到 workspace/queue.json；
+	// 批处理任务队列（PRD §3）：任务持久化到「安装目录/dataList/queue.json」；
 	// 运行中任务被取消时终止引擎进程树以中断推理（与旧 CancelBatch 一致）。
-	a.q = queue.New(&queueExecutor{app: a}, a.emitQueueEvent, filepath.Join(workspaceDir(), "queue.json"))
+	a.q = queue.New(&queueExecutor{app: a}, a.emitQueueEvent, queueFilePath())
 	a.q.SetOnCancel(func(t *queue.BatchTask) {
 		if t.Type == queue.TypeInpaint {
 			a.engineMu.Lock()
@@ -394,16 +403,29 @@ func fileSHA1(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// downloadAudioWithRetry 带一次自动重试的音频下载。社媒 CDN 存在偶发限流/
-// 风控（典型表现：同一链接同一 Cookie 昨日可取、今日失败），短暂退避后
-// 重走完整候选链（每次都会重新逐条探测，不复用失败结果）。
+// downloadAudioWithRetry 音频下载：候选级重试 + 有限次的链级重试。
+//
+// 两层重试职责分离，互不重叠：
+//   - 候选级（downloader 内部）：按错误类型决定是否重试同一个地址。
+//     404 与「内容非音频」只试一次，网络类错误退避后重试；
+//   - 链级（本函数）：仅当整条链失败、且失败原因属于可恢复类别
+//     （网络 / 超时 / 限流 / 5xx）时，退避后重新走一遍。
+//
+// 旧实现任何失败都无条件重跑整条链——对 404、非音频这类必然失败的地址白跑
+// 一轮，还让「已自动重试仍失败」的提示掩盖了真实原因。
 func downloadAudioWithRetry(ctx context.Context, candidates []string, dir, filename string) (string, error) {
-	if len(candidates) == 0 {
+	// 前端只回传地址列表；来源信息由候选链注册表恢复（见 CandidatesFromURLs）
+	list := downloader.CandidatesFromURLs(candidates)
+	if len(list) == 0 {
 		return "", fmt.Errorf("该帖子没有可下载的 BGM")
 	}
-	saved, err := downloader.DownloadAudioWithFallback(ctx, candidates, dir, filename)
+	saved, err := downloader.DownloadAudioWithFallback(ctx, list, dir, filename)
 	if err == nil {
 		return saved, nil
+	}
+	// 不可恢复：重跑整条链只会得到同样的失败，直接给出真实原因
+	if !downloader.AudioErrorRetryableAcrossChain(err) {
+		return "", friendlyAudioError(err)
 	}
 	// 退避 1.5s 后重试一次（尊重 ctx 取消）
 	select {
@@ -411,10 +433,22 @@ func downloadAudioWithRetry(ctx context.Context, candidates []string, dir, filen
 	case <-ctx.Done():
 		return "", err
 	}
-	if saved2, err2 := downloader.DownloadAudioWithFallback(ctx, candidates, dir, filename); err2 == nil {
+	if saved2, err2 := downloader.DownloadAudioWithFallback(ctx, list, dir, filename); err2 == nil {
 		return saved2, nil
 	}
-	return "", fmt.Errorf(
+	return "", friendlyAudioError(err)
+}
+
+// friendlyAudioError 把底层错误包装成面向用户的提示。
+//
+// 区分两种情况：不可恢复的失败再试也是白试，如实说明即可；只有「瞬态失败
+// 且已重试仍失败」才值得建议稍后重试或配置 Cookie。
+func friendlyAudioError(err error) error {
+	if !downloader.AudioErrorRetryableAcrossChain(err) {
+		return fmt.Errorf("BGM 获取失败：%w。建议：① 该帖可能没有可用的 BGM 音频，"+
+			"或平台已限制该音频下载；② 图片不受影响，可先正常去水印", err)
+	}
+	return fmt.Errorf(
 		"BGM 获取失败（已自动重试仍失败，多为平台风控或 CDN 临时限制）：%w。"+
 			"建议：① 稍后重试；② 抖音帖子请配置登录 Cookie（首页「抖音 Cookie 设置」）后再试；"+
 			"③ 图片不受影响，可先正常去水印", err)
@@ -443,7 +477,8 @@ func (a *App) DownloadBGMStandalone(candidates []string, filename string) (strin
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if len(candidates) == 0 {
+	list := downloader.CandidatesFromURLs(candidates)
+	if len(list) == 0 {
 		return "", fmt.Errorf("该帖子没有可下载的 BGM")
 	}
 
@@ -453,7 +488,7 @@ func (a *App) DownloadBGMStandalone(candidates []string, filename string) (strin
 	}
 	defer os.RemoveAll(tmpDir)
 
-	tmpFile, err := downloader.DownloadAudioWithFallback(ctx, candidates, tmpDir, filename)
+	tmpFile, err := downloader.DownloadAudioWithFallback(ctx, list, tmpDir, filename)
 	if err != nil {
 		return "", err
 	}
@@ -543,9 +578,14 @@ func (a *App) GetBGMAudio(candidates []string, localPath string) (string, error)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// 缓存键用候选链的规范化签名而非原始 URL：CDN 地址带 x-expires/sign 等
-	// 时效参数，同一曲目每次解析出的 URL 都不同，直接哈希 URL 会导致缓存永不命中。
-	cacheDir := filepath.Join(appDataDir(), "bgm-cache", shortHash(audioCacheKey(candidates)))
+	// 缓存键优先用平台音乐 ID——它比 CDN 地址稳定得多；解析阶段未登记时
+	// 退化到候选链的规范化签名（去掉主机名与签名/时效参数），使同一曲目
+	// 无论 CDN 域或签名如何变化都落到同一缓存目录。
+	cacheID := downloader.ChainMusicID(candidates)
+	if cacheID == "" {
+		cacheID = downloader.CandidateChainKey(candidates)
+	}
+	cacheDir := filepath.Join(appDataDir(), "bgm-cache", shortHash(cacheID))
 	if hit := firstAudioFile(cacheDir); hit != "" {
 		return audioDataURL(hit)
 	}
@@ -562,32 +602,11 @@ func (a *App) GetBGMAudio(candidates []string, localPath string) (string, error)
 // audioCacheKey 由候选链生成稳定缓存键：去掉查询串（签名/时效参数）与
 // 主机名差异，只保留各候选的路径部分、去重后排序，使同一曲目无论 CDN 域或
 // 签名如何变化、候选数量多少，都落到同一缓存目录。
+//
+// 实现已下沉到 downloader 包——缓存目录、候选源偏好、候选链注册表三处共用
+// 同一份签名逻辑，避免规则漂移。此处保留薄包装以维持既有调用与测试契约。
 func audioCacheKey(candidates []string) string {
-	paths := make([]string, 0, len(candidates))
-	seen := make(map[string]bool, len(candidates))
-	for _, u := range candidates {
-		if u = strings.TrimSpace(u); u == "" {
-			continue
-		}
-		if i := strings.Index(u, "?"); i >= 0 {
-			u = u[:i]
-		}
-		if i := strings.Index(u, "://"); i >= 0 {
-			if j := strings.IndexByte(u[i+3:], '/'); j >= 0 {
-				u = u[i+3+j:]
-			}
-		}
-		if u == "" || seen[u] {
-			continue
-		}
-		seen[u] = true
-		paths = append(paths, u)
-	}
-	if len(paths) == 0 {
-		return strings.Join(candidates, "|")
-	}
-	sort.Strings(paths)
-	return strings.Join(paths, "|")
+	return downloader.CandidateChainKey(candidates)
 }
 
 // audioDataURL 读取本地音频并编码为 data URL。
@@ -750,7 +769,13 @@ type queueExecutor struct{ app *App }
 // RunDownload 执行下载任务。平台不支持/视频链接/无图属确定性错误（重试无益），
 // 其余（网络超时、风控拦截、CDN 波动）按瞬时错误走自动重试——重试会重新
 // 解析链接、重走候选链，不复用可能已过期的旧地址。
-func (e *queueExecutor) RunDownload(ctx context.Context, t *queue.BatchTask) (string, string, []string, error) {
+//
+// BGM 取源随图片一同返回并落库（见 queue.DownloadResult）：自动入队后「去框选」
+// 只能凭任务记录还原帖子上下文，不落库就等于在框选页丢掉 BGM。
+// 但 BGM 是可选项，其探测失败绝不能连累图片结果——若整条候选链都不可达
+// （过期/风控），清空候选链并照常返回图片，由前端提示「暂无可用 BGM」。
+func (e *queueExecutor) RunDownload(ctx context.Context, t *queue.BatchTask) (queue.DownloadResult, error) {
+	var res queue.DownloadResult
 	emit := func(msg string) {
 		if e.app.ctx != nil {
 			runtime.EventsEmit(e.app.ctx, "download:progress", map[string]string{"msg": msg})
@@ -761,11 +786,106 @@ func (e *queueExecutor) RunDownload(ctx context.Context, t *queue.BatchTask) (st
 		if errors.Is(err, downloader.ErrUnsupportedPlatform) ||
 			errors.Is(err, downloader.ErrVideoNotSupported) ||
 			errors.Is(err, downloader.ErrNoImages) {
-			return "", "", nil, queue.Permanent(err)
+			return res, queue.Permanent(err)
 		}
-		return "", "", nil, err
+		return res, err
 	}
-	return post.Dir, fmt.Sprintf("%s | %d 张", post.Title, post.Count), post.Files, nil
+	res.Dir = post.Dir
+	res.PostRef = fmt.Sprintf("%s | %d 张", post.Title, post.Count)
+	res.Files = post.Files
+
+	cands := post.AudioCandidates
+	if len(cands) == 0 && post.AudioURL != "" {
+		cands = []string{post.AudioURL}
+	}
+	// AudioResolved 在探测前置位：此刻「帖子有没有 BGM」已有定论（候选链是否
+	// 为空即是答案），后面的健康检查只影响候选是否可用，不改这个定论。
+	res.AudioResolved = true
+	res.AudioNm = post.AudioName
+	res.Audio = e.app.healthyAudioCandidates(ctx, cands)
+	if len(res.Audio) > 0 {
+		res.AudioURL = res.Audio[0]
+	}
+	return res, nil
+}
+
+// healthyAudioCandidates 逐条探测候选地址是否仍然可达，只保留可用项。
+//
+// 为什么要探测：抖音图文帖的 BGM 地址是带时效的对象存储直链，下载完成到用户
+// 点「去框选」可能间隔数小时；不做过滤就会把已 404/403 的死链落库，前端据此
+// 显示的「下载BGM」按钮点了必失败——比按钮不显示更糟。
+// 探测只发 HEAD/小范围 GET，代价很小；全部不可达时返回空链（前端提示无可用 BGM）。
+func (a *App) healthyAudioCandidates(ctx context.Context, cands []string) []string {
+	if len(cands) == 0 {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, audioProbeBudget)
+	defer cancel()
+
+	out := make([]string, 0, len(cands))
+	for _, u := range cands {
+		if err := downloader.ProbeAudio(probeCtx, u); err != nil {
+			if a.ctx != nil {
+				runtime.EventsEmit(a.ctx, "download:progress", map[string]string{
+					"msg": fmt.Sprintf("BGM 地址不可用，已跳过：%s", shortURL(u)),
+				})
+			}
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+// audioProbeBudget BGM 候选探测的总时间预算（各候选共享，防卡住下载任务）。
+const audioProbeBudget = 10 * time.Second
+
+// shortURL 截断长地址用于日志展示。
+func shortURL(u string) string {
+	if len(u) <= 96 {
+		return u
+	}
+	return u[:93] + "…"
+}
+
+// ResolveTaskAudio 回源补取历史任务的 BGM（该任务入队时 BGM 尚未随任务落库）。
+// 仅做解析，不下载音频；未找到 BGM 时返回空链且 err 为 nil。
+func (e *queueExecutor) ResolveTaskAudio(ctx context.Context, t *queue.BatchTask) ([]string, string, error) {
+	if strings.TrimSpace(t.URL) == "" {
+		return nil, "", nil
+	}
+	emit := func(msg string) {
+		if e.app.ctx != nil {
+			runtime.EventsEmit(e.app.ctx, "download:progress", map[string]string{"msg": msg})
+		}
+	}
+	platform, clean, err := downloader.DetectPlatform(t.URL)
+	if err != nil {
+		return nil, "", err
+	}
+	// 只解析元数据，图片落盘到临时目录后即弃——本方法只为拿 BGM 地址。
+	tmpDir, err := os.MkdirTemp("", "lama-audio-resolve-*")
+	if err != nil {
+		return nil, "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var post *downloader.Post
+	switch platform {
+	case "wechat":
+		post, err = downloader.DownloadWeChat(ctx, clean, tmpDir)
+	case "xhs":
+		post, err = downloader.DownloadXHS(ctx, clean, tmpDir)
+	case "douyin":
+		post, err = downloader.DownloadDouyin(ctx, clean, tmpDir)
+	default:
+		err = downloader.ErrUnsupportedPlatform
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	emit(fmt.Sprintf("已补取 BGM 取源：%d 条候选", len(post.AudioCandidates)))
+	return e.app.healthyAudioCandidates(ctx, post.AudioCandidates), post.AudioName, nil
 }
 
 // RunInpaint 执行去水印任务（单张失败不视为任务错误，结果经汇总传达）。
@@ -847,14 +967,95 @@ func (a *App) RemoveQueueTask(id string) error {
 	return a.q.Remove(id)
 }
 
+// taskAudioPayload 任务 BGM 取源的返回值（Wails 绑定无法返回多值）。
+type taskAudioPayload struct {
+	Candidates []string `json:"candidates"`
+	Name       string   `json:"name"`
+}
+
+// ResolveTaskAudio 回源补取指定下载任务的 BGM 取源（历史任务兼容路径）。
+//
+// 背景：BGM 取源字段随本次改造才落到队列任务上，此前完成的任务没有这份数据，
+// 前端从队列「去框选」时无法还原 BGM 按钮。前端在检测到「任务无 BGM 数据
+// 且未探测过」时调用本方法补取，结果写回任务并持久化；同一任务只补取一次。
+// 未找到 BGM 时返回空候选链且 err 为 nil（不是错误）。
+func (a *App) ResolveTaskAudio(id string) (*taskAudioPayload, error) {
+	if a.q == nil {
+		return nil, fmt.Errorf("任务队列未就绪，请重启应用")
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cands, name, err := a.q.ResolveTaskAudio(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &taskAudioPayload{Candidates: cands, Name: name}, nil
+}
+
 // ClearFinishedTasks 清空终态任务记录。taskType 为空清全部；否则仅清该类型
 // （download | inpaint）——两类队列独立管理。
 func (a *App) ClearFinishedTasks(taskType string) error {
 	if a.q == nil {
 		return fmt.Errorf("任务队列未就绪")
 	}
-	a.q.ClearFinished(taskType)
+	return a.clearTasksAndFiles(queue.ClearFilter{Type: taskType})
+}
+
+// ClearGroupTasks 清空「某一时间分组」内的终态任务（队列面板每组的一键清空），
+// 并同步删除这些任务在工作区中的本地文件。
+//
+// 参数用秒级 Unix 时间戳而非 time.Time：Wails 绑定对 time.Time 的序列化
+// 依赖前端 models.ts 的转换器，而这两个值只是区间边界，用 int64 更稳且
+// 前端无需构造 Date。since/until 为 0 表示该侧不限。
+//
+// taskType 为空不限类型；仅清终态——排队中/执行中的任务绝不会被删。
+func (a *App) ClearGroupTasks(taskType string, since, until int64) error {
+	if a.q == nil {
+		return fmt.Errorf("任务队列未就绪")
+	}
+	f := queue.ClearFilter{Type: taskType}
+	if since > 0 {
+		f.Since = time.Unix(since, 0)
+	}
+	if until > 0 {
+		f.Until = time.Unix(until, 0)
+	}
+	return a.clearTasksAndFiles(f)
+}
+
+// clearTasksAndFiles 清空匹配的任务记录，并回收其引用的本地文件。
+//
+// 顺序很关键：**先取快照算好文件路径、再删记录、最后删文件**。反过来的话
+// 记录一删就拿不到路径清单，工作区里会留下一堆再也没人认领的孤儿目录。
+//
+// 文件删除失败不回滚记录：记录已经清掉，残留目录下次会被顶栏「清除缓存」
+// 以「未被任务记录引用」的身份回收——两条清理路径互为兜底。
+func (a *App) clearTasksAndFiles(f queue.ClearFilter) error {
+	doomed := a.q.WouldClear(f)
+	var paths []string
+	for _, t := range doomed {
+		paths = append(paths, taskLocalPaths(t)...)
+	}
+	a.q.ClearFinishedFiltered(f)
+	_, _ = a.removeWorkspacePaths(paths)
 	return nil
+}
+
+// taskLocalPaths 取出一条任务记录引用的所有本地路径。
+//
+// download：结果目录 + 图片清单（清单里的文件可能被手动移动过，故目录也带上）；
+// inpaint：源目录 + 输出目录。这些路径在删除前先做工作区内边界检查。
+func taskLocalPaths(t queue.BatchTask) []string {
+	var out []string
+	for _, p := range []string{t.ResultDir, t.InDir, t.OutDir} {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	out = append(out, t.Files...)
+	return out
 }
 
 // ---------------------------------------------------------- 预览与输出
@@ -1042,6 +1243,356 @@ func workspaceDir() string {
 	dir := filepath.Join(appDataDir(), "workspace")
 	_ = os.MkdirAll(dir, 0o755)
 	return dir
+}
+
+// ---------------------------------------------------------- 缓存清理
+
+// CacheClearPayload 缓存清理结果。Wails 绑定不能返回多值，故用结构体承载。
+//
+// 前端据此组装 toast 文案：未清任何东西（Nothing=true）时提示「已是干净状态」，
+// 而非「已清除 0 B」——后者会让用户怀疑按钮失效。
+type CacheClearPayload struct {
+	FreedBytes int64 `json:"freedBytes"` // 实际释放的字节数
+	Files      int   `json:"files"`      // 删除的文件数
+	Kept       int   `json:"kept"`       // 因被任务记录引用而保留的条目数
+	Nothing    bool  `json:"nothing"`    // 目录不存在或无需清理
+}
+
+// CacheUsagePayload 缓存目录用量预估（供二次确认弹窗展示）。
+type CacheUsagePayload struct {
+	TotalBytes int64 `json:"totalBytes"` // 缓存目录总占用
+	FreeBytes  int64 `json:"freeBytes"`  // 预计可释放（未被任务记录引用的部分）
+	KeptBytes  int64 `json:"keptBytes"`  // 被任务记录引用而保留的部分
+	KeptDir    int   `json:"keptDir"`    // 被引用的目录数
+}
+
+// workspaceUsage 扫描缓存目录，返回 (总占用, 可释放, 被引用保留, 被引用目录数)。
+//
+// 判定「被引用」的依据是队列任务的路径字段：download 任务的 resultDir 与
+// files[]、inpaint 任务的 inDir / outDir / resultDir。任何落在这些路径下的
+// 文件都视为仍需使用，不计入可释放空间。
+//
+// keptDirs 只统计「被直接引用」的目录（不再往下重复计数），否则一条记录里
+// 的 downloads 容器、平台层、素材层会各算一次，数字虚高、失去参考意义。
+func (a *App) workspaceUsage(root string) (total, free int64, kept int64, keptDirs int) {
+	used := a.workspaceReferencedPaths()
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // 单项不可读（权限/占用）不应中断整体统计
+		}
+		if d.IsDir() {
+			// 只把「记录里直接指向的目录」计入 keptDirs；
+			// 落在其内部的子目录会命中 Contains 分支，不重复计数。
+			if isReferenced(used, path) && pathReferencedDirectly(used, path) {
+				keptDirs++
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		size := info.Size()
+		total += size
+		if isReferenced(used, path) {
+			kept += size
+		} else {
+			free += size
+		}
+		return nil
+	})
+	return total, free, kept, keptDirs
+}
+
+// pathReferencedDirectly 判断 path 是否恰好等于某条记录的引用路径
+// （而非仅仅是「位于被引用目录之内」）。
+func pathReferencedDirectly(used []string, path string) bool {
+	p := normPath(path)
+	for _, u := range used {
+		if normPath(u) == p {
+			return true
+		}
+	}
+	return false
+}
+
+// workspaceReferencedPaths 汇总队列任务记录中引用的所有本地路径。
+//
+// 非终态任务（pending/running/retry_wait）的目录同样纳入——它们正在被
+// 引擎读写，删掉会直接导致任务失败。
+func (a *App) workspaceReferencedPaths() []string {
+	if a.q == nil {
+		return nil
+	}
+	var out []string
+	for _, t := range a.q.Snapshot() {
+		for _, p := range []string{t.ResultDir, t.InDir, t.OutDir} {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		out = append(out, t.Files...)
+	}
+	return out
+}
+
+// isReferenced 判断 path 是否指向某条任务记录引用的文件/目录（或其内部）。
+//
+// 双向包含都要判：记录里存的是目录时，目录内的文件应视为被引用；
+// 记录里存的是文件时，其所在目录本身也不该被整目录删除。
+func isReferenced(used []string, path string) bool {
+	p := normPath(path)
+	for _, u := range used {
+		n := normPath(u)
+		if n == "" {
+			continue
+		}
+		if p == n || strings.HasPrefix(p, n+string(filepath.Separator)) ||
+			strings.HasPrefix(n, p+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// normPath 规范化路径用于前缀比较：统一分隔符、清理末尾分隔符、统一小写
+// （Windows 文件系统大小写不敏感；大小写不同会被误判为「未引用」而误删）。
+func normPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	p = filepath.Clean(p)
+	p = strings.TrimSuffix(p, string(filepath.Separator))
+	return strings.ToLower(p)
+}
+
+// GetCacheUsage 返回缓存目录用量预估，供前端二次确认弹窗显示。
+func (a *App) GetCacheUsage() *CacheUsagePayload {
+	return a.getCacheUsageAt(workspaceDir())
+}
+
+// getCacheUsageAt 是 GetCacheUsage 的实现，root 显式传入便于单测。
+func (a *App) getCacheUsageAt(root string) *CacheUsagePayload {
+	if _, err := os.Stat(root); err != nil {
+		return &CacheUsagePayload{}
+	}
+	total, free, kept, keptDirs := a.workspaceUsage(root)
+	return &CacheUsagePayload{
+		TotalBytes: total,
+		FreeBytes:  free,
+		KeptBytes:  kept,
+		KeptDir:    keptDirs,
+	}
+}
+
+// ClearWorkspaceCache 清除缓存目录中「未被任务记录引用」的文件。
+//
+// 与任务记录的关系：任务记录（<安装目录>/dataList/queue.json）中出现的路径
+// 一律保留，这样历史任务的「查看结果 / 去框选」仍可正常打开；被清掉的是
+// 旧版本遗留、已无任务记录指向的素材。要连同记录一起清，用任务队列面板的
+// 「清空」——那一侧会同步调用本方法回收对应文件。
+//
+// 策略：自顶向下遍历，遇到「完全未被引用」的顶层条目直接 RemoveAll
+// （比逐文件删快得多，且能清掉空目录）；只要某层还引用着就逐层下探。
+func (a *App) ClearWorkspaceCache() (*CacheClearPayload, error) {
+	return a.clearWorkspaceCacheAt(workspaceDir())
+}
+
+// clearWorkspaceCacheAt 是 ClearWorkspaceCache 的实现，root 显式传入便于单测。
+func (a *App) clearWorkspaceCacheAt(root string) (*CacheClearPayload, error) {
+	if _, err := os.Stat(root); err != nil {
+		return &CacheClearPayload{Nothing: true}, nil
+	}
+	used := a.workspaceReferencedPaths()
+	var freed int64
+	var files, kept int
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取缓存目录: %w", err)
+	}
+	for _, e := range entries {
+		full := filepath.Join(root, e.Name())
+		if isReferenced(used, full) {
+			// 顶层条目被引用：下探清理其内部未被引用的子项
+			f, n, k := removeUnreferencedInside(full, used)
+			freed += f
+			files += n
+			kept += k
+			continue
+		}
+		size, cnt := entrySize(full)
+		if err := os.RemoveAll(full); err != nil {
+			// 单个条目删除失败（文件被占用等）不应中断整体清理，继续处理其余
+			continue
+		}
+		freed += size
+		files += cnt
+	}
+	if files == 0 {
+		return &CacheClearPayload{Kept: kept, Nothing: true}, nil
+	}
+	return &CacheClearPayload{FreedBytes: freed, Files: files, Kept: kept}, nil
+}
+
+// removeUnreferencedInside 保留 dir 自身、递归清理其内部未被引用的子项。
+// 返回 (释放字节数, 删除文件数, 保留条目数)。
+//
+// 必须递归：被引用的目录（如 downloads/douyin/keep-me）往往嵌在多级容器里，
+// 只清理一层的话，同层未被引用的兄弟目录会永远留在盘上。
+func removeUnreferencedInside(dir string, used []string) (int64, int, int) {
+	var freed int64
+	var files, kept int
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0, 0
+	}
+	for _, e := range entries {
+		full := filepath.Join(dir, e.Name())
+		if isReferenced(used, full) {
+			if e.IsDir() {
+				// 被引用的目录：继续下探，清掉它内部未被引用的部分
+				f, n, k := removeUnreferencedInside(full, used)
+				freed += f
+				files += n
+				kept += k
+			} else {
+				kept++
+			}
+			continue
+		}
+		size, cnt := entrySize(full)
+		if err := os.RemoveAll(full); err != nil {
+			continue
+		}
+		freed += size
+		files += cnt
+	}
+	return freed, files, kept
+}
+
+// entrySize 统计单个文件/目录的大小与文件数（目录递归累加）。
+func entrySize(path string) (int64, int) {
+	var size int64
+	var files int
+	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			size += info.Size()
+			files++
+		}
+		return nil
+	})
+	return size, files
+}
+
+// removeWorkspacePaths 删除任务记录引用的一组路径（用于「清除任务记录」时
+// 同步回收本地文件）。返回 (释放字节数, 删除条目数)。
+//
+// 只删工作区内的路径：记录可能被手改成外部目录（或用户导入的队列 JSON），
+// 越界删除会误伤工作区外的文件。
+func (a *App) removeWorkspacePaths(paths []string) (int64, int) {
+	return removePathsUnder(workspaceDir(), paths)
+}
+
+// removePathsUnder 删除 root 之下、paths 指定的条目。返回 (释放字节数, 删除文件数)。
+func removePathsUnder(root string, paths []string) (int64, int) {
+	nroot := normPath(root)
+	var freed int64
+	var n int
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		np := normPath(p)
+		if seen[np] {
+			continue
+		}
+		seen[np] = true
+		// 边界检查：必须位于 root 之内（root 自身不允许删）
+		if np == nroot || !strings.HasPrefix(np, nroot+string(filepath.Separator)) {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		size, cnt := entrySize(p)
+		if err := os.RemoveAll(p); err != nil {
+			continue
+		}
+		freed += size
+		n += cnt
+	}
+	return freed, n
+}
+
+// installDir 当前安装目录（即主程序 exe 所在目录）。
+//
+// 用途：任务数据按用户要求存到「安装目录下的 dataList」，跟随安装位置而非
+// 用户配置目录——卸载/迁移安装目录时任务数据一并带走，便于整体备份。
+//
+// 取值优先级：
+//  1. exe 自身路径所在目录（生产环境；Inno 默认装到 %LOCALAPPDATA%\Programs\
+//     LaMaWatermarkRemover，PrivilegesRequired=lowest 无需管理员权限即可写）；
+//  2. 退化到当前工作目录（开发态 `go run` / 单测，此时无安装语义）。
+//
+// 注意：安装目录可能不可写（例如用户手动装到 Program Files 且无写权限），
+// 故调用方必须容忍 MkdirAll 失败——queue 侧对写盘失败是静默忽略的，
+// 队列在内存中照常工作，只是不落盘。
+func installDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		if wd, err2 := os.Getwd(); err2 == nil {
+			return wd
+		}
+		return "."
+	}
+	// 解析符号链接：某些打包/快捷方式场景下 argv[0] 指向链接而非真实文件
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe)
+}
+
+// queueFilePath 任务数据的持久化路径：<安装目录>/dataList/queue.json。
+// 目录不可创建时仍返回该路径——queue 的 save 会失败但不影响内存队列运行。
+func queueFilePath() string {
+	dir := filepath.Join(installDir(), "dataList")
+	_ = os.MkdirAll(dir, 0o755)
+	dst := filepath.Join(dir, "queue.json")
+	migrateLegacyQueue(dst)
+	return dst
+}
+
+// migrateLegacyQueue 一次性迁移旧位置的队列数据。
+//
+// 1.1.10 之前任务存在 %LOCALAPPDATA%\LaMaWatermarkRemover\workspace\queue.json，
+// 迁移后新位置若尚无数据而旧文件存在，则搬过去——否则用户升级后此前排队的
+// 任务会凭空消失。只在目标不存在时迁移一次，之后旧文件不再被读取
+// （迁移成功后删除旧文件，避免用户在新位置清空后又「复活」旧任务）。
+func migrateLegacyQueue(dst string) {
+	_ = migrateLegacyQueueFrom(filepath.Join(workspaceDir(), "queue.json"), dst)
+}
+
+// migrateLegacyQueueFrom 迁移的实际实现（旧路径显式传入，便于单测不碰真实目录）。
+// 返回错误仅用于测试断言；生产调用方忽略之——任何失败都只意味着「这次没迁成」，
+// 保留旧文件，下次启动再试，绝不影响应用启动。
+func migrateLegacyQueueFrom(old, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		return nil // 新位置已有数据，无需迁移
+	}
+	data, err := os.ReadFile(old)
+	if err != nil {
+		return nil // 旧文件不存在或无权限：全新安装，无数据可迁
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		return err // 目标不可写（如只读安装目录）：保留旧文件，下次启动再试
+	}
+	_ = os.Remove(old)
+	return nil
 }
 
 // appDataDir 应用数据目录，用于 workspace、平台 Cookie 持久化等：
